@@ -1,0 +1,14 @@
+/target
+
+arch.md
+todo.md
+CLAUDE.md
+
+task_plan.md
+findings.md
+progress.md
+
+.DS_Store
+.github/*
+data/*
+.env
