@@ -1,0 +1,139 @@
+[package]
+name = "clawdbot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "一个高性能跨平台 AI 消息机器人 - Rust 实现"
+
+# 优化构建配置
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# ==================== 依赖配置 ====================
+
+[dependencies]
+
+# -------------------- 异步运行时 --------------------
+# Tokio：Rust 最流行的异步运行时，用于处理高并发
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"  # 为 trait 添加 async 支持
+
+# -------------------- Web 框架 --------------------
+# Axum：现代 Rust Web 框架，用于处理 HTTP 请求（如飞书 Webhook）
+axum = { version = "0.7", features = ["ws"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "timeout"] }
+# clap：命令行参数解析
+clap = { version = "4.4", features = ["derive"] }
+
+# -------------------- ORM 与数据库 --------------------
+# sqlx：异步 SQL 工具箱（Phase 2 将使用 Sea-ORM）
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+# rusqlite：SQLite 驱动
+rusqlite = { version = "0.29", features = ["bundled", "serde_json", "chrono"] }
+# sea-orm = { version = "0.12", features = ["runtime-tokio-rustls", "sqlite-async"] }  # Phase 2 添加
+
+# -------------------- HTTP 客户端 --------------------
+# reqwest：简单易用的 HTTP 客户端，用于调用 AI API 和飞书 API
+reqwest = { version = "0.11", features = ["json", "stream"] }
+# hyper：底层 HTTP 实现
+hyper = { version = "1.0", features = ["full"] }
+# tungstenite：WebSocket 客户端
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+# url：URL 解析
+url = "2.5"
+
+# -------------------- 配置解析 --------------------
+# toml：TOML 格式配置解析
+toml = "0.8"
+# dotenv：自动加载 .env 文件
+dotenv = "0.15"
+# serde：序列化/反序列化框架
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_json5 = "0.2"  # JSON5 格式支持（支持注释）
+serde_yaml = "0.9"   # YAML 格式支持
+
+# -------------------- 日志与追踪 --------------------
+# tracing：结构化日志和追踪（异步安全）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+tracing-appender = "0.2"  # 日志文件输出
+
+# -------------------- 错误处理 --------------------
+# thiserror：简洁的错误类型定义
+thiserror = "1.0"
+# anyhow：通用错误类型（用于错误处理）
+anyhow = "1.0"
+
+# -------------------- 工具库 --------------------
+# uuid：生成唯一 ID
+uuid = { version = "1.6", features = ["v4"] }
+# chrono：日期时间处理
+chrono = { version = "0.4", features = ["serde"] }
+# regex：正则表达式
+regex = "1.10"
+# lazy_static：静态变量延迟初始化
+lazy_static = "1.4"
+# dashmap：高性能并发 HashMap
+dashmap = "6.0"
+# tokio-stream：异步流处理
+tokio-stream = "0.1"
+# futures：异步编程工具
+futures = "0.3"
+# parking_lot：高性能同步原语
+parking_lot = "0.12"
+
+# -------------------- 媒体处理 --------------------
+# image：图片处理库
+image = "0.24"
+
+# -------------------- URL 和 编码 --------------------
+# base64：Base64 编码
+base64 = "0.22"
+
+# -------------------- 加密和安全 --------------------
+# hmac：HMAC 签名（用于飞书签名验证）
+hmac = "0.12"
+# sha2：SHA256 哈希（用于飞书签名验证）
+sha2 = "0.10"
+
+# ==================== 开发依赖 ====================
+
+[dev-dependencies]
+# tokio-test：异步测试
+tokio-test = "0.4"
+# assert_fs：文件系统断言测试
+assert_fs = "1.0"
+# fake：生成测试数据
+fake = "2.9"
+
+# ==================== 功能特性 ====================
+
+[features]
+# 默认开启所有渠道
+default = ["full-channel"]
+# 全部渠道
+full-channel = ["feishu", "telegram", "discord", "slack"]
+# 飞书渠道（首选）
+feishu = []
+# Telegram 渠道
+telegram = []
+# Discord 渠道
+discord = []
+# Slack 渠道
+slack = []
+# macOS 特定功能
+macos = []
+
+# ==================== 规范配置 ====================
+
+# 确保依赖版本兼容
+# [lints.rust]  # Rust 1.75+ 支持
+
+# 允许未使用的依赖（开发阶段）
+[package.metadata.docs.rs]
+all-features = true
