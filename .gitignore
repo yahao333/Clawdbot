@@ -12,3 +12,4 @@ progress.md
 .github/*
 data/*
 .env
+clawdbot.toml
