@@ -194,6 +194,8 @@ pub struct WebState {
     pub auth_config: Arc<RwLock<AuthConfig>>,
     /// WebSocket 管理器
     pub ws_manager: Arc<WebSocketManager>,
+    /// 日志缓冲区（最多保留1000条）
+    pub log_buffer: Arc<RwLock<Vec<LogEntry>>>,
 }
 
 impl WebState {
@@ -215,7 +217,37 @@ impl WebState {
             channel_status: Arc::new(RwLock::new(HashMap::new())),
             auth_config: Arc::new(RwLock::new(AuthConfig::default())),
             ws_manager: Arc::new(WebSocketManager::new()),
+            log_buffer: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// 添加日志条目
+    pub async fn add_log(&self, entry: LogEntry) {
+        let mut buffer = self.log_buffer.write().await;
+        buffer.push(entry);
+        // 保留最多1000条
+        if buffer.len() > 1000 {
+            buffer.remove(0);
+        }
+    }
+
+    /// 获取所有日志
+    pub async fn get_logs(&self) -> Vec<LogEntry> {
+        self.log_buffer.read().await.clone()
+    }
+
+    /// 按级别过滤日志
+    pub async fn get_logs_by_level(&self, level: &str) -> Vec<LogEntry> {
+        self.log_buffer.read().await
+            .iter()
+            .filter(|log| log.level == level)
+            .cloned()
+            .collect()
+    }
+
+    /// 清空日志
+    pub async fn clear_logs(&self) {
+        self.log_buffer.write().await.clear();
     }
 
     /// 更新渠道连接状态
@@ -268,6 +300,16 @@ pub struct ChannelConnectionStatus {
     pub last_connected: Option<String>,
     pub last_error: Option<String>,
     pub message_count: u64,
+}
+
+/// 日志条目
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+    pub module: Option<String>,
+    pub source: Option<String>,
 }
 
 /// 消息统计 - 增强版
@@ -1445,6 +1487,11 @@ async fn api_user_stats() -> Json<JsonValue> {
     }))
 }
 
+// 日志管理页面
+async fn logs_handler() -> Html<&'static str> {
+    Html(HTML_LOGS)
+}
+
 // 审计管理页面
 async fn audit_handler() -> Html<&'static str> {
     Html(HTML_AUDIT)
@@ -1593,6 +1640,44 @@ async fn api_audit_cleanup(State(state): State<WebState>) -> Json<JsonValue> {
     }
 }
 
+// ==================== 日志 API ====================
+
+/// 获取所有日志
+async fn api_logs(State(state): State<WebState>) -> Json<JsonValue> {
+    let logs = state.get_logs().await;
+    Json(json!({
+        "logs": logs,
+        "count": logs.len()
+    }))
+}
+
+/// 按级别获取日志
+async fn api_logs_by_level(
+    State(state): State<WebState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<JsonValue> {
+    let level = params.get("level").map(|s| s.as_str()).unwrap_or("all");
+    let logs = if level == "all" {
+        state.get_logs().await
+    } else {
+        state.get_logs_by_level(level).await
+    };
+    Json(json!({
+        "logs": logs,
+        "count": logs.len(),
+        "level": level
+    }))
+}
+
+/// 清空日志
+async fn api_logs_clear(State(state): State<WebState>) -> Json<JsonValue> {
+    state.clear_logs().await;
+    Json(json!({
+        "success": true,
+        "message": "日志已清空"
+    }))
+}
+
 // ==================== Web 服务器 ====================
 
 /// Web 服务器
@@ -1623,6 +1708,7 @@ impl WebServer {
                 channel_status: Arc::new(RwLock::new(HashMap::new())),
                 auth_config: Arc::new(RwLock::new(AuthConfig::default())),
                 ws_manager: Arc::new(WebSocketManager::new()),
+                log_buffer: Arc::new(RwLock::new(Vec::new())),
             }),
         }
     }
@@ -1729,6 +1815,11 @@ impl WebServer {
             .route("/api/operations/sessions", get(api_active_sessions))
             .route("/api/operations/messages", get(api_message_history))
             .route("/api/operations/users", get(api_user_stats))
+            // API - 日志管理
+            .route("/logs", get(logs_handler))
+            .route("/api/logs", get(api_logs))
+            .route("/api/logs/level", get(api_logs_by_level))
+            .route("/api/logs/clear", post(api_logs_clear))
             // API - 审计管理
             .route("/api/audit/stats", get(api_audit_stats))
             .route("/api/audit/logs", get(api_audit_logs))
@@ -2030,6 +2121,7 @@ const HTML_INDEX: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/logs">日志管理</a></li>
             <li><a href="/audit">安全审计</a></li>
         </ul>
         <div class="sidebar-footer">
@@ -2240,6 +2332,7 @@ const HTML_DEBUG: &str = r#"
             <li><a href="/debug" class="active">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/logs">日志管理</a></li>
             <li><a href="/audit">安全审计</a></li>
         </ul>
         <div class="sidebar-footer">
@@ -2363,6 +2456,7 @@ const HTML_CONFIG: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config" class="active">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/logs">日志管理</a></li>
             <li><a href="/audit">安全审计</a></li>
         </ul>
         <div class="sidebar-footer">
@@ -2412,6 +2506,7 @@ const HTML_OPERATIONS: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations" class="active">运营数据</a></li>
+            <li><a href="/logs">日志管理</a></li>
             <li><a href="/audit">安全审计</a></li>
         </ul>
         <div class="sidebar-footer">
@@ -2439,6 +2534,198 @@ const HTML_OPERATIONS: &str = r#"
         </section>
     </main>
     <script src="/static/app.js"></script>
+</body>
+</html>
+"#;
+
+// 日志管理页面
+const HTML_LOGS: &str = r#"
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>日志管理 - Clawdbot</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .log-header h1 { margin-bottom: 0; }
+        .header-actions { display: flex; gap: 10px; }
+        .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+        .filter-bar select, .filter-bar input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .log-level-info { background: #cce5ff; color: #004085; }
+        .log-level-warn { background: #fff3cd; color: #856404; }
+        .log-level-error { background: #f8d7da; color: #721c24; }
+        .log-level-debug { background: #e9ecef; color: #495057; }
+        .log-level { padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: 500; }
+        .log-table { width: 100%; border-collapse: collapse; }
+        .log-table th, .log-table td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+        .log-table th { background: #f8f9fa; font-weight: 600; position: sticky; top: 0; }
+        .log-table tr:hover { background: #f8f9fa; }
+        .log-container { max-height: calc(100vh - 200px); overflow-y: auto; }
+        .log-message { font-family: monospace; font-size: 13px; word-break: break-all; }
+        .log-timestamp { white-space: nowrap; color: #666; font-size: 12px; }
+        .clear-btn { background: #dc3545; }
+        .clear-btn:hover { background: #c82333; }
+        .refresh-btn { background: #28a745; }
+        .refresh-btn:hover { background: #218838; }
+        .log-count { padding: 8px 15px; background: #f8f9fa; border-radius: 4px; font-size: 14px; color: #666; }
+        #logList { min-height: 200px; }
+        .empty-log { text-align: center; padding: 40px; color: #999; }
+    </style>
+</head>
+<body>
+    <nav class="sidebar">
+        <h1>Clawdbot</h1>
+        <ul>
+            <li><a href="/">首页</a></li>
+            <li><a href="/debug">调试监控</a></li>
+            <li><a href="/config">配置管理</a></li>
+            <li><a href="/operations">运营数据</a></li>
+            <li><a href="/logs" class="active">日志管理</a></li>
+            <li><a href="/logs">日志管理</a></li>
+            <li><a href="/audit">安全审计</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            <button class="logout-btn" onclick="logout()">退出登录</button>
+        </div>
+    </nav>
+    <main>
+        <div class="log-header">
+            <h1>系统日志</h1>
+            <div class="header-actions">
+                <span class="log-count" id="logCount">共 0 条日志</span>
+                <button class="refresh-btn" onclick="loadLogs()">刷新</button>
+                <button class="clear-btn" onclick="clearLogs()">清空日志</button>
+            </div>
+        </div>
+
+        <div class="filter-bar">
+            <label>日志级别：</label>
+            <select id="levelFilter" onchange="loadLogs()">
+                <option value="all">全部</option>
+                <option value="INFO">INFO</option>
+                <option value="WARN">WARN</option>
+                <option value="ERROR">ERROR</option>
+                <option value="DEBUG">DEBUG</option>
+            </select>
+            <input type="text" id="searchFilter" placeholder="搜索日志内容..." onkeyup="filterLogs()">
+        </div>
+
+        <div class="card log-container">
+            <table class="log-table">
+                <thead>
+                    <tr>
+                        <th style="width: 180px;">时间戳</th>
+                        <th style="width: 80px;">级别</th>
+                        <th>日志内容</th>
+                        <th style="width: 120px;">来源</th>
+                    </tr>
+                </thead>
+                <tbody id="logList">
+                    <tr><td colspan="4" class="empty-log">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </main>
+
+    <script src="/static/app.js"></script>
+    <script>
+        let allLogs = [];
+
+        // 页面加载时获取日志
+        document.addEventListener('DOMContentLoaded', () => {
+            loadLogs();
+        });
+
+        // 加载日志
+        async function loadLogs() {
+            const level = document.getElementById('levelFilter').value;
+            const url = level === 'all' ? '/api/logs' : '/api/logs/level?level=' + encodeURIComponent(level);
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (data.logs) {
+                    // 按时间戳倒序排列
+                    allLogs = data.logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                    filterLogs();
+                }
+            } catch (e) {
+                console.error('加载日志失败:', e);
+                document.getElementById('logList').innerHTML = '<tr><td colspan="4" class="empty-log">加载失败: ' + escapeHtml(e.message) + '</td></tr>';
+            }
+        }
+
+        // 过滤日志
+        function filterLogs() {
+            const searchText = document.getElementById('searchFilter').value.toLowerCase();
+            const filtered = allLogs.filter(log => {
+                if (searchText && !log.message.toLowerCase().includes(searchText) &&
+                    (!log.module || !log.module.toLowerCase().includes(searchText)) &&
+                    (!log.source || !log.source.toLowerCase().includes(searchText))) {
+                    return false;
+                }
+                return true;
+            });
+
+            renderLogs(filtered);
+        }
+
+        // 渲染日志列表
+        function renderLogs(logs) {
+            const container = document.getElementById('logList');
+            document.getElementById('logCount').textContent = '共 ' + logs.length + ' 条日志';
+
+            if (logs.length === 0) {
+                container.innerHTML = '<tr><td colspan="4" class="empty-log">暂无日志</td></tr>';
+                return;
+            }
+
+            let html = '';
+            logs.forEach(log => {
+                const levelClass = 'log-level-' + log.level.toLowerCase();
+                const module = log.module || log.source || '-';
+                html += '<tr>';
+                html += '<td class="log-timestamp">' + escapeHtml(log.timestamp) + '</td>';
+                html += '<td><span class="log-level ' + levelClass + '">' + escapeHtml(log.level) + '</span></td>';
+                html += '<td class="log-message">' + escapeHtml(log.message) + '</td>';
+                html += '<td>' + escapeHtml(module) + '</td>';
+                html += '</tr>';
+            });
+
+            container.innerHTML = html;
+        }
+
+        // 清空日志
+        async function clearLogs() {
+            if (!confirm('确定要清空所有日志吗？此操作不可恢复。')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/logs/clear', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.success) {
+                    allLogs = [];
+                    renderLogs([]);
+                    alert('日志已清空');
+                } else {
+                    alert('清空失败: ' + (data.message || data.error));
+                }
+            } catch (e) {
+                alert('清空失败: ' + e.message);
+            }
+        }
+
+        // 退出登录
+        function logout() {
+            fetch('/api/auth/logout', { method: 'POST' })
+                .then(() => window.location.reload());
+        }
+    </script>
 </body>
 </html>
 "#;
