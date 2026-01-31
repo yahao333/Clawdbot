@@ -1954,8 +1954,29 @@ const HTML_INDEX: &str = r#"
         }
         .dashboard-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
+            grid-template-rows: auto 1fr;
             gap: 20px;
+        }
+        /* 渠道状态 - 第一行第一列 */
+        .dashboard-section.channels {
+            grid-column: 1 / 2;
+            grid-row: 1 / 2;
+        }
+        /* 性能指标 - 第一行第二列 */
+        .dashboard-section.performance {
+            grid-column: 2 / 3;
+            grid-row: 1 / 2;
+        }
+        /* 快捷操作 - 第一行第三列 */
+        .dashboard-section.quick-actions {
+            grid-column: 3 / 4;
+            grid-row: 1 / 2;
+        }
+        /* 最近消息 - 第二行独占整行 */
+        .dashboard-section.messages {
+            grid-column: 1 / 4;
+            grid-row: 2 / 3;
         }
         .dashboard-section {
             background: #fff;
@@ -1974,7 +1995,9 @@ const HTML_INDEX: &str = r#"
         .channel-list {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
+            max-height: 200px;
+            overflow-y: auto;
         }
         .channel-item {
             display: flex;
@@ -2021,7 +2044,8 @@ const HTML_INDEX: &str = r#"
             display: flex;
             flex-direction: column;
             gap: 8px;
-            max-height: 300px;
+            max-height: calc(100vh - 380px);
+            min-height: 400px;
             overflow-y: auto;
         }
         .message-item {
@@ -2106,7 +2130,20 @@ const HTML_INDEX: &str = r#"
         }
         @media (max-width: 1200px) {
             .stat-cards { grid-template-columns: repeat(2, 1fr); }
-            .dashboard-grid { grid-template-columns: 1fr; }
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto auto 1fr auto;
+            }
+            .dashboard-section.channels,
+            .dashboard-section.performance,
+            .dashboard-section.quick-actions {
+                grid-column: 1 / 2;
+                grid-row: auto;
+            }
+            .dashboard-section.messages {
+                grid-column: 1 / 2;
+                grid-row: auto;
+            }
         }
         @media (max-width: 768px) {
             .stat-cards { grid-template-columns: 1fr; }
@@ -2163,16 +2200,16 @@ const HTML_INDEX: &str = r#"
 
         <!-- 主体网格 -->
         <div class="dashboard-grid">
-            <!-- 渠道状态 -->
-            <div class="dashboard-section">
-                <h2>📡 渠道连接状态</h2>
+            <!-- 渠道状态 - 紧凑显示 -->
+            <div class="dashboard-section channels">
+                <h2>📡 渠道</h2>
                 <div class="channel-list" id="channelList">
                     <div class="empty-message">加载中...</div>
                 </div>
             </div>
 
-            <!-- 最近消息 -->
-            <div class="dashboard-section">
+            <!-- 最近消息 - 占大区域 -->
+            <div class="dashboard-section messages">
                 <h2>💬 最近消息</h2>
                 <div class="message-list" id="recentMessages">
                     <div class="empty-message">暂无消息</div>
@@ -2180,7 +2217,7 @@ const HTML_INDEX: &str = r#"
             </div>
 
             <!-- 性能指标 -->
-            <div class="dashboard-section">
+            <div class="dashboard-section performance">
                 <h2>⚡ 性能指标</h2>
                 <div class="performance-metrics">
                     <div class="metric-item">
@@ -2199,7 +2236,7 @@ const HTML_INDEX: &str = r#"
             </div>
 
             <!-- 快捷操作 -->
-            <div class="dashboard-section">
+            <div class="dashboard-section quick-actions">
                 <h2>🚀 快捷操作</h2>
                 <div class="quick-actions">
                     <a href="/debug" class="quick-action-btn">📊 查看统计</a>
