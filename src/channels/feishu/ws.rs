@@ -3,6 +3,7 @@
 //! 实现飞书消息的 WebSocket 长连接接收。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio::signal;
@@ -12,6 +13,10 @@ use tracing::{debug, error, info, warn};
 use super::client::FeishuClient;
 use super::handlers::{FeishuEventRequest, MessageEventHandler};
 use crate::core::message::{HandlerContext, MessageHandler};
+
+/// 服务启动时间戳（毫秒），用于过滤历史消息
+/// 飞书在 WebSocket 连接后会推送服务离线期间的消息，这些旧消息需要被忽略
+static SERVICE_START_TIME_MS: AtomicI64 = AtomicI64::new(0);
 
 /// WebSocket 配置
 #[derive(Debug, Clone)]
@@ -45,6 +50,24 @@ impl WsConfig {
             .and_then(|m| m.get("message_id"))
         {
             return message_id.as_str().map(|s| s.to_string());
+        }
+        None
+    }
+
+    /// 从事件数据中提取消息创建时间（毫秒时间戳）
+    ///
+    /// 用于过滤服务启动前的历史消息
+    fn extract_message_create_time(event_data: &serde_json::Value) -> Option<i64> {
+        // event_data 已经是 event 对象，从 message.create_time 提取
+        if let Some(create_time) = event_data.get("message")
+            .and_then(|m| m.get("create_time"))
+        {
+            // create_time 可能是字符串格式的时间戳
+            if let Some(time_str) = create_time.as_str() {
+                return time_str.parse::<i64>().ok();
+            }
+            // 也可能是数字格式
+            return create_time.as_i64();
         }
         None
     }
@@ -142,6 +165,12 @@ impl FeishuWsMonitor {
     /// 启动监控服务
     pub async fn start(&self) -> Result<tokio::task::JoinHandle<()>, crate::infra::error::Error> {
         info!("启动飞书 WebSocket 监控服务（长链接）");
+
+        // 记录服务启动时间，用于过滤历史消息
+        // 飞书在 WebSocket 连接后会推送服务离线期间的消息，这些旧消息需要被忽略
+        let start_time_ms = chrono::Utc::now().timestamp_millis();
+        SERVICE_START_TIME_MS.store(start_time_ms, Ordering::SeqCst);
+        info!(start_time_ms = start_time_ms, "记录服务启动时间，将忽略启动前的历史消息");
 
         let client = self.client.clone();
         let event_handler = self.event_handler.clone();
@@ -616,6 +645,21 @@ impl FeishuWsMonitor {
 
         // 清理过期条目 (保留 5 分钟)
         processed_messages.retain(|_, &mut v| now.duration_since(v) < Duration::from_secs(300));
+
+        // 检查消息创建时间，过滤服务启动前的历史消息
+        // 飞书在 WebSocket 连接后会推送服务离线期间的消息，这些旧消息需要被忽略
+        let service_start_time = SERVICE_START_TIME_MS.load(Ordering::SeqCst);
+        if let Some(msg_create_time) = WsConfig::extract_message_create_time(&event_data) {
+            if msg_create_time < service_start_time {
+                debug!(
+                    event_id = %event_id,
+                    msg_create_time = msg_create_time,
+                    service_start_time = service_start_time,
+                    "忽略服务启动前的历史消息"
+                );
+                return;
+            }
+        }
 
         // 从事件数据中提取 message_id 进行去重
         // 注意：飞书的 event_id 每次推送都不同，但 message_id 是消息的唯一标识

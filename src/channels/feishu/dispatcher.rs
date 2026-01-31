@@ -185,11 +185,13 @@ mod tests {
     #[tokio::test]
     async fn test_event_dispatcher_register_and_dispatch() {
         let dispatcher = EventDispatcher::new();
-        let mut called = false;
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
 
-        let handler = |_data: Value| -> HandlerFuture {
+        let handler = move |_data: Value| -> HandlerFuture {
+            let called_inner = called_clone.clone();
             Box::pin(async move {
-                called = true;
+                called_inner.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             })
         };
@@ -198,7 +200,7 @@ mod tests {
         let result = dispatcher.dispatch("test.event", serde_json::json!({"key": "value"})).await;
 
         assert!(result.is_ok());
-        assert!(called);
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ use crate::channels::feishu::{FeishuClient, FeishuCredentials, FeishuWsMonitor, 
 use crate::core::message::{HandlerContext, MessageQueue, DefaultMessageHandler, UnifiedMessageSender, queue::QueueConfig};
 use crate::core::routing::DefaultRouter;
 use crate::core::agent::{AiEngine, DefaultAiEngine};
+use crate::core::session::SessionManager;
 use crate::infra::config::{Config, ConfigLoader};
 
 /// 服务状态
@@ -127,6 +128,14 @@ impl ClawdbotService {
         let queue_config = QueueConfig::default();
         let message_queue = Arc::new(MessageQueue::new(queue_config));
         let ai_engine: Arc<dyn AiEngine> = Arc::new(DefaultAiEngine::new(config));
+        // 创建会话管理器
+        let session_config = crate::core::session::SessionConfig {
+            expire_seconds: config.session.expire_seconds.unwrap_or(3600),
+            max_history: config.session.max_history.unwrap_or(50),
+            persist_enabled: config.session.persist_enabled.unwrap_or(true),
+            db_path: config.session.db_path.clone().unwrap_or_else(|| "data/clawdbot.db".to_string()),
+        };
+        let session_manager = Arc::new(SessionManager::new(Some(session_config)).await);
         // 数据库初始化暂时跳过
         // let database = Arc::new(Database::new("data/clawdbot.db").await?);
 
@@ -142,6 +151,7 @@ impl ClawdbotService {
             router.clone(),
             ai_engine.clone(),
             sender,
+            session_manager,
         );
 
         // 启动消息队列处理循环

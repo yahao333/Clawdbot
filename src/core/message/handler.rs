@@ -23,6 +23,7 @@ use tracing::{debug, info, instrument, warn};
 use super::{types::InboundMessage, types::OutboundMessage, queue::MessageQueue, sender::MessageSender};
 use crate::core::routing::Router;
 use crate::core::agent::AiEngine;
+use crate::core::session::SessionManager;
 use crate::infra::error::Result;
 
 /// 消息处理上下文
@@ -35,6 +36,7 @@ use crate::infra::error::Result;
 /// * `router` - 路由器（用于路由消息到 Agent）
 /// * `ai_engine` - AI 引擎（用于生成响应）
 /// * `sender` - 消息发送器（用于发送响应）
+/// * `session_manager` - 会话管理器（用于会话管理和消息去重）
 #[derive(Clone)]
 pub struct HandlerContext {
     /// 配置
@@ -47,6 +49,8 @@ pub struct HandlerContext {
     ai_engine: Arc<dyn AiEngine>,
     /// 消息发送器
     sender: Arc<dyn MessageSender>,
+    /// 会话管理器
+    session_manager: Arc<SessionManager>,
 }
 
 impl HandlerContext {
@@ -58,6 +62,7 @@ impl HandlerContext {
     /// * `router` - 路由器
     /// * `ai_engine` - AI 引擎
     /// * `sender` - 消息发送器
+    /// * `session_manager` - 会话管理器
     ///
     /// # 返回值
     /// 创建的上下文
@@ -67,6 +72,7 @@ impl HandlerContext {
         router: Arc<dyn Router>,
         ai_engine: Arc<dyn AiEngine>,
         sender: Arc<dyn MessageSender>,
+        session_manager: Arc<SessionManager>,
     ) -> Self {
         Self {
             config,
@@ -74,6 +80,7 @@ impl HandlerContext {
             router,
             ai_engine,
             sender,
+            session_manager,
         }
     }
 }
@@ -214,8 +221,7 @@ impl DefaultMessageHandler {
         let message_id = message.id.clone();
         debug!(message_id = %message_id, "开始从队列消费并处理消息");
 
-        // 4. 路由到对应的 Agent
-        debug!(sender_id = %message.sender.id, "路由消息到 Agent");
+        // 获取会话
         let route_match = match ctx.router.route(&message).await {
             Ok(r) => r,
             Err(e) => {
@@ -224,11 +230,27 @@ impl DefaultMessageHandler {
             }
         };
 
+        // 会话去重检查
+        let session = ctx.session_manager.get_or_create_session(&message, &route_match.agent_id).await;
+        if ctx.session_manager.is_message_processed(&message_id, &session.id).await {
+            info!(message_id = %message_id, "消息已处理过，跳过");
+            return;
+        }
+
         info!(
             agent_id = %route_match.agent_id,
             confidence = route_match.confidence,
+            session_id = %session.id,
             "消息路由成功"
         );
+
+        // 提取消息内容用于历史记录
+        let message_content = message.content.text.clone()
+            .or(message.content.rich_text.as_ref().map(|r| r.content.clone()))
+            .unwrap_or_default();
+
+        // 添加用户消息到会话历史
+        ctx.session_manager.add_message_to_session(&session.id, "user", &message_content).await;
 
         // 5. AI 执行生成响应
         debug!("开始 AI 执行");
@@ -239,6 +261,11 @@ impl DefaultMessageHandler {
                  return;
              }
         };
+
+        // 添加助手响应到会话历史
+        if let Some(ref text) = response.text {
+            ctx.session_manager.add_message_to_session(&session.id, "assistant", text).await;
+        }
 
         // 6. 发送响应
         debug!("准备发送响应");
@@ -251,14 +278,14 @@ impl DefaultMessageHandler {
                 enable_push: Some(true),
                 card: None,
             };
-            
+
             match ctx.sender.send(outbound).await {
                 Ok(msg_id) => info!(response_id = %msg_id, "响应发送成功"),
                 Err(e) => tracing::error!(error = %e, "响应发送失败"),
             }
         }
 
-        info!(message_id = %message_id, "消息处理完成");
+        info!(message_id = %message_id, session_id = %session.id, "消息处理完成");
     }
 }
 

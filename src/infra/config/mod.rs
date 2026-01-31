@@ -22,6 +22,33 @@ pub struct Config {
     /// 安全审计配置
     #[serde(default)]
     pub security: SecurityConfig,
+    /// 会话配置
+    #[serde(default)]
+    pub session: SessionConfig,
+}
+
+/// 会话配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// 会话过期时间（秒）
+    pub expire_seconds: Option<u64>,
+    /// 最大历史消息数
+    pub max_history: Option<usize>,
+    /// 是否持久化到数据库
+    pub persist_enabled: Option<bool>,
+    /// 数据库路径
+    pub db_path: Option<String>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            expire_seconds: Some(3600),
+            max_history: Some(50),
+            persist_enabled: Some(true),
+            db_path: Some("data/clawdbot.db".to_string()),
+        }
+    }
 }
 
 /// AI 配置
