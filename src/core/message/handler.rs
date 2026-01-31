@@ -196,13 +196,33 @@ impl MessageHandler for DefaultMessageHandler {
 
         // 3. 消息队列处理（去重和防抖）
         debug!("消息入队处理");
-        let processed_message = ctx.queue.push(message.clone())
+        let _ = ctx.queue.push(message.clone())
             .await
             .map_err(|e| crate::infra::error::Error::Channel(e.to_string()))?;
 
+        // 7. 调用处理后钩子（表示已成功入队）
+        self.after_handle(&message, &Ok(())).await;
+
+        info!(message_id = %message_id, "消息已入队待处理");
+        Ok(())
+    }
+}
+
+impl DefaultMessageHandler {
+    /// 核心消息处理逻辑（由队列消费者调用）
+    pub async fn process_message(ctx: HandlerContext, message: InboundMessage) {
+        let message_id = message.id.clone();
+        debug!(message_id = %message_id, "开始从队列消费并处理消息");
+
         // 4. 路由到对应的 Agent
         debug!(sender_id = %message.sender.id, "路由消息到 Agent");
-        let route_match = ctx.router.route(&message).await?;
+        let route_match = match ctx.router.route(&message).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "消息路由失败");
+                return;
+            }
+        };
 
         info!(
             agent_id = %route_match.agent_id,
@@ -212,17 +232,22 @@ impl MessageHandler for DefaultMessageHandler {
 
         // 5. AI 执行生成响应
         debug!("开始 AI 执行");
-        let response = ctx.ai_engine.execute(&route_match.agent_id, &processed_message).await?;
+        let response = match ctx.ai_engine.execute(&route_match.agent_id, &message).await {
+             Ok(r) => r,
+             Err(e) => {
+                 tracing::error!(error = %e, "AI 执行失败");
+                 return;
+             }
+        };
 
         // 6. 发送响应
         debug!("准备发送响应");
-        // response 是 MessageContent，response.text 是 Option<String>
         if let Some(resp_content) = response.text {
              let outbound = OutboundMessage {
                 target_id: message.target.id.clone(), // 回复给同一个目标
                 channel: message.channel.clone(),     // 使用相同的渠道
                 content: super::types::MessageContent::text(&resp_content),
-                thread_id: None, // TODO: 支持线程回复
+                thread_id: None,
                 enable_push: Some(true),
                 card: None,
             };
@@ -233,11 +258,7 @@ impl MessageHandler for DefaultMessageHandler {
             }
         }
 
-        // 7. 调用处理后钩子
-        self.after_handle(&message, &Ok(())).await;
-
         info!(message_id = %message_id, "消息处理完成");
-        Ok(())
     }
 }
 

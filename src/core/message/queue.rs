@@ -18,13 +18,13 @@
 //! - `Sequential`: 所有消息顺序处理
 //! - `PerSender`: 同一发送者的消息顺序处理，不同发送者并行
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use dashmap::DashMap;
-use tracing::{debug, warn};
+use tracing::{debug, warn, error, info};
 
 /// 消息去重键
 ///
@@ -166,6 +166,8 @@ pub struct MessageQueue {
     config: Arc<QueueConfig>,
     /// 消息发送通道
     sender: mpsc::Sender<super::types::InboundMessage>,
+    /// 消息接收通道（用于处理）
+    receiver: Arc<Mutex<Option<mpsc::Receiver<super::types::InboundMessage>>>>,
     /// 活跃消息追踪（用于去重）
     active_messages: Arc<DashMap<DedupeKey, std::time::Instant>>,
     /// 发送者分组（用于 PerSender 模式）
@@ -185,11 +187,12 @@ impl MessageQueue {
     /// - INFO: 队列创建成功
     pub fn new(config: QueueConfig) -> Self {
         // 创建 mpsc 通道，容量为配置指定的大小
-        let (sender, _) = mpsc::channel(config.cap);
+        let (sender, receiver) = mpsc::channel(config.cap);
 
         let queue = Self {
             config: Arc::new(config),
             sender,
+            receiver: Arc::new(Mutex::new(Some(receiver))),
             active_messages: Arc::new(DashMap::new()),
             sender_groups: Arc::new(DashMap::new()),
         };
@@ -201,6 +204,54 @@ impl MessageQueue {
         );
 
         queue
+    }
+
+    /// 启动消息处理循环
+    ///
+    /// # 参数说明
+    /// * `processor` - 消息处理函数
+    ///
+    /// # 功能
+    /// 启动一个后台任务，持续从队列中消费消息并调用处理函数
+    pub fn start_processing<F, Fut>(&self, processor: F)
+    where
+        F: Fn(super::types::InboundMessage) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let receiver_mutex = self.receiver.clone();
+        let processor = Arc::new(processor);
+        let mode = self.config.mode;
+
+        tokio::spawn(async move {
+            let mut receiver_guard = receiver_mutex.lock().await;
+            if let Some(mut receiver) = receiver_guard.take() {
+                info!("消息队列处理循环已启动");
+                drop(receiver_guard); // 释放锁
+
+                while let Some(message) = receiver.recv().await {
+                    let processor = processor.clone();
+                    match mode {
+                        QueueMode::Parallel => {
+                            tokio::spawn(async move {
+                                processor(message).await;
+                            });
+                        }
+                        QueueMode::Sequential => {
+                            processor(message).await;
+                        }
+                        QueueMode::PerSender => {
+                            // 简化实现：暂时按 Parallel 处理，后续完善
+                             tokio::spawn(async move {
+                                processor(message).await;
+                            });
+                        }
+                    }
+                }
+                warn!("消息队列接收端已关闭");
+            } else {
+                warn!("消息队列处理循环已在运行或接收端已失效");
+            }
+        });
     }
 
     /// 检查消息是否重复

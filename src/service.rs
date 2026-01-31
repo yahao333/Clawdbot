@@ -144,6 +144,15 @@ impl ClawdbotService {
             sender,
         );
 
+        // 启动消息队列处理循环
+        let ctx_clone = handler_context.clone();
+        message_queue.start_processing(move |msg| {
+            let ctx = ctx_clone.clone();
+            async move {
+                DefaultMessageHandler::process_message(ctx, msg).await;
+            }
+        });
+
         let message_handler: Arc<dyn crate::core::message::MessageHandler> = Arc::new(DefaultMessageHandler::default());
 
         // 创建事件处理器
