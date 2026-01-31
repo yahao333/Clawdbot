@@ -163,5 +163,10 @@ name = "feishu_send_card_with_buttons"
 path = "examples/feishu_send.rs"
 required-features = ["feishu"]
 
+[[example]]
+name = "feishu_receive"
+path = "examples/feishu_receive.rs"
+required-features = ["feishu"]
+
 [package.metadata.docs.rs]
 all-features = true

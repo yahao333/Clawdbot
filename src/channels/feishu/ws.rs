@@ -304,18 +304,59 @@ impl FeishuWsMonitor {
                     // 处理 WebSocket 消息
                     match tokio::time::timeout(read_timeout, ws.next()).await {
                         Ok(Some(Ok(msg))) => {
-                            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
-                                if let Err(e) = Self::process_message(
-                                    &text,
-                                    ws,
-                                    processed_messages,
-                                    event_handler,
-                                    &*handler_context,
-                                    &*message_handler,
-                                    client,
-                                ).await {
-                                    error!(error = %e, "处理消息失败");
+                            match msg {
+                                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                    if let Err(e) = Self::process_message(
+                                        &text,
+                                        ws,
+                                        processed_messages,
+                                        event_handler,
+                                        &*handler_context,
+                                        &*message_handler,
+                                        client,
+                                    ).await {
+                                        error!(error = %e, "处理消息失败");
+                                    }
                                 }
+                                tokio_tungstenite::tungstenite::Message::Binary(bin) => {
+                                    info!(length = bin.len(), "收到二进制 WebSocket 消息 (可能需要 Protobuf 解析)");
+                                    // 打印前 50 个字节的十六进制
+                                    let preview_len = std::cmp::min(bin.len(), 50);
+                                    let hex_preview: Vec<String> = bin[..preview_len].iter().map(|b| format!("{:02X}", b)).collect();
+                                    info!(hex = %hex_preview.join(" "), "二进制消息预览");
+                                    
+                                    // 尝试查找 JSON 开始的标记 '{' (0x7B)
+                                    if let Some(start_idx) = bin.iter().position(|&b| b == 0x7B) {
+                                         if let Ok(text) = String::from_utf8(bin[start_idx..].to_vec()) {
+                                             info!(json_maybe = %text, "尝试从二进制中提取 JSON");
+                                             // 尝试解析提取出的 JSON
+                                             if let Err(e) = Self::process_message(
+                                                 &text,
+                                                 ws,
+                                                 processed_messages,
+                                                 event_handler,
+                                                 handler_context,
+                                                 message_handler,
+                                                 client,
+                                             ).await {
+                                                 error!(error = %e, "处理提取的 JSON 消息失败");
+                                             }
+                                         }
+                                    }
+                                }
+                                tokio_tungstenite::tungstenite::Message::Ping(data) => {
+                                    info!(len = data.len(), "收到底层 Ping 帧");
+                                    // Tungstenite 自动处理 Ping，但我们也记录一下
+                                }
+                                tokio_tungstenite::tungstenite::Message::Pong(_) => {
+                                    // info!("收到底层 Pong 帧");
+                                }
+                                tokio_tungstenite::tungstenite::Message::Close(_) => {
+                                    warn!("收到 Close 帧");
+                                    let _ = exit_tx.send(()).await;
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
                         Ok(None) => {
@@ -365,12 +406,74 @@ impl FeishuWsMonitor {
         // 详细调试日志：显示原始消息
         info!(raw_message = %text, "收到 WebSocket 消息");
 
-        // 解析消息
-        let msg: WsMessage = match serde_json::from_str(text) {
-            Ok(m) => m,
-            Err(e) => {
+        // 使用 StreamDeserializer 只解析第一个完整的 JSON 对象，忽略后面的 garbage
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+        let value = match stream.next() {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
                 error!(error = %e, raw = %text, "解析 WebSocket 消息失败");
                 return Err(crate::infra::error::Error::Serialization(e.to_string()));
+            }
+            None => {
+                warn!("WebSocket 消息为空");
+                return Ok(());
+            }
+        };
+
+        // 检查是否是 V2 格式 (含有 schema: "2.0")
+        if let Some(schema) = value.get("schema").and_then(|s| s.as_str()) {
+            if schema == "2.0" {
+                info!("检测到飞书 V2 WebSocket 消息格式");
+                
+                // 提取 event_id (用于去重)
+                let event_id = value.get("header")
+                    .and_then(|h| h.get("event_id"))
+                    .and_then(|id| id.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                // 提取 event_type
+                let event_type = value.get("header")
+                    .and_then(|h| h.get("event_type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+
+                info!(event_id = %event_id, event_type = %event_type, "V2 事件信息");
+
+                if event_type == "im.message.receive_v1" {
+                    if let Some(event_data) = value.get("event") {
+                        Self::handle_message_event(
+                            &event_id,
+                            event_data.clone(),
+                            processed_messages,
+                            event_handler,
+                            handler_context,
+                            message_handler,
+                            client,
+                        ).await;
+                    }
+                } else if event_type == "im.message.message_read_v1" {
+                    // 忽略已读回执
+                    debug!("忽略消息已读事件");
+                } else {
+                    info!(event_type = %event_type, "跳过其他事件类型");
+                }
+                
+                // V2 协议不需要应用层 ack (通常由 SDK 或底层处理，或者不需要)
+                // 如果需要 ack，通常是 HTTP 响应，但 WebSocket 可能是单向推送
+                return Ok(());
+            }
+        }
+
+        // 尝试解析为 WsMessage (旧版/V1 逻辑)
+        let msg: WsMessage = match serde_json::from_value(value) {
+            Ok(m) => m,
+            Err(e) => {
+                // 如果不是 WsMessage 且不是 V2，可能是 ping (如果是 json 格式)
+                // 但通常 ping 会被上面的 from_value 解析 (因为有 type: ping)
+                // 这里只记录错误
+                warn!(error = %e, "无法解析为标准 WsMessage");
+                return Ok(()); 
             }
         };
 
