@@ -1198,6 +1198,138 @@ async fn api_stats(State(state): State<WebState>) -> Json<MessageStats> {
     Json(stats.clone())
 }
 
+/// 仪表盘统计数据
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardStats {
+    /// 服务状态
+    pub service_status: String,
+    /// 今日消息数
+    pub today_messages: u64,
+    /// 活跃会话数
+    pub active_sessions: u64,
+    /// AI 成功率 (%)
+    pub ai_success_rate: f64,
+    /// 平均响应时间 (ms)
+    pub avg_response_time_ms: f64,
+    /// 今日 Token 使用量
+    pub today_tokens: u64,
+    /// 渠道状态列表
+    pub channels: Vec<ChannelInfo>,
+    /// 最近消息列表
+    pub recent_messages: Vec<RecentMessage>,
+}
+
+/// 渠道信息
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelInfo {
+    /// 渠道名称
+    pub name: String,
+    /// 显示名称
+    pub display_name: String,
+    /// 是否已连接
+    pub connected: bool,
+    /// 消息数量
+    pub message_count: u64,
+    /// 图标
+    pub icon: String,
+}
+
+/// 最近消息
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentMessage {
+    /// 时间
+    pub time: String,
+    /// 渠道
+    pub channel: String,
+    /// 用户
+    pub user: String,
+    /// 内容摘要
+    pub content: String,
+}
+
+/// 获取仪表盘统计数据
+async fn api_dashboard_stats(State(state): State<WebState>) -> Json<DashboardStats> {
+    let service_status = state.service_status.read().await;
+    let message_stats = state.message_stats.read().await;
+    let channel_status = state.channel_status.read().await;
+    let history = state.conversation_history.read().await;
+
+    // 计算 AI 成功率
+    let ai_success_rate = if message_stats.ai_requests_total > 0 {
+        (message_stats.ai_requests_success as f64 / message_stats.ai_requests_total as f64) * 100.0
+    } else {
+        100.0
+    };
+
+    // 构建渠道状态列表
+    let mut channels = Vec::new();
+    for (name, status) in &*channel_status {
+        let (display_name, icon) = match name.as_str() {
+            "feishu" => ("飞书", "🔗"),
+            "telegram" => ("Telegram", "📱"),
+            "discord" => ("Discord", "💬"),
+            _ => (name.as_str(), "📡"),
+        };
+        channels.push(ChannelInfo {
+            name: name.clone(),
+            display_name: display_name.to_string(),
+            connected: status.connected,
+            message_count: status.message_count,
+            icon: icon.to_string(),
+        });
+    }
+
+    // 如果没有渠道状态，添加默认飞书
+    if channels.is_empty() {
+        channels.push(ChannelInfo {
+            name: "feishu".to_string(),
+            display_name: "飞书".to_string(),
+            connected: false,
+            message_count: 0,
+            icon: "🔗".to_string(),
+        });
+    }
+
+    // 构建最近消息列表（取最近5条）
+    let recent_messages: Vec<RecentMessage> = history
+        .iter()
+        .rev()
+        .take(5)
+        .map(|conv| {
+            let content = if conv.message.len() > 50 {
+                &conv.message[..50]
+            } else {
+                &conv.message
+            }.to_string();
+            RecentMessage {
+                time: conv.timestamp.format("%H:%M").to_string(),
+                channel: conv.channel.clone(),
+                user: conv.user_name.clone().unwrap_or_else(|| conv.user_id.clone()),
+                content,
+            }
+        })
+        .collect();
+
+    let status_str = match &*service_status {
+        ServiceStatus::Running => "running",
+        ServiceStatus::Initializing => "initializing",
+        ServiceStatus::Stopping => "stopping",
+        ServiceStatus::Stopped => "stopped",
+        ServiceStatus::Error(_) => "error",
+    };
+
+    Json(DashboardStats {
+        service_status: status_str.to_string(),
+        today_messages: message_stats.today_messages,
+        active_sessions: message_stats.active_sessions,
+        ai_success_rate,
+        avg_response_time_ms: message_stats.avg_response_time_ms,
+        today_tokens: message_stats.today_tokens,
+        channels,
+        recent_messages,
+    })
+}
+
 // 清除历史
 async fn api_clear_history(State(state): State<WebState>) -> Json<JsonValue> {
     let mut history = state.conversation_history.write().await;
@@ -1530,6 +1662,8 @@ impl WebServer {
             .route("/api/debug/history", get(api_conversation_history))
             .route("/api/debug/stats", get(api_stats))
             .route("/api/debug/clear", post(api_clear_history))
+            // API - 仪表盘
+            .route("/api/dashboard/stats", get(api_dashboard_stats))
             // API - 服务状态
             .route("/api/status", get(api_status_handler))
             // API - 配置管理
@@ -1589,21 +1723,256 @@ async fn static_app_js() -> impl IntoResponse {
 
 // ==================== 前端页面 ====================
 
-// 首页
+// 首页 - 仪表盘风格
 const HTML_INDEX: &str = r#"
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clawdbot 管理界面</title>
+    <title>Clawdbot 仪表盘</title>
     <link rel="stylesheet" href="/static/style.css">
+    <style>
+        /* 仪表盘特定样式 */
+        .dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .dashboard-header h1 {
+            margin-bottom: 0;
+        }
+        .header-actions {
+            display: flex;
+            gap: 10px;
+        }
+        .refresh-btn {
+            background: #28a745;
+        }
+        .refresh-btn:hover {
+            background: #218838;
+        }
+        .stat-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: var(--card-accent, #007bff);
+        }
+        .stat-card.service { --card-accent: #28a745; }
+        .stat-card.messages { --card-accent: #17a2b8; }
+        .stat-card.sessions { --card-accent: #6f42c1; }
+        .stat-card.ai { --card-accent: #fd7e14; }
+        .stat-card .stat-icon {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+        .stat-card .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        .stat-card .stat-label {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        .stat-card .stat-status {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #dc3545;
+        }
+        .stat-card .stat-status.running {
+            background: #28a745;
+            box-shadow: 0 0 8px rgba(40,167,69,0.5);
+        }
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .dashboard-section {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .dashboard-section h2 {
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .channel-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .channel-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            transition: all 0.2s;
+        }
+        .channel-item:hover {
+            background: #e9ecef;
+        }
+        .channel-icon {
+            font-size: 1.5rem;
+            margin-right: 15px;
+        }
+        .channel-info {
+            flex: 1;
+        }
+        .channel-name {
+            font-weight: 600;
+            color: #333;
+        }
+        .channel-stats {
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 3px;
+        }
+        .channel-status {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .channel-status.connected {
+            background: #d4edda;
+            color: #155724;
+        }
+        .channel-status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .message-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .message-item {
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+        .message-time {
+            color: #999;
+            font-size: 0.8rem;
+            min-width: 45px;
+        }
+        .message-channel {
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            background: #e9ecef;
+            border-radius: 4px;
+            color: #666;
+        }
+        .message-user {
+            font-weight: 600;
+            color: #007bff;
+            font-size: 0.9rem;
+        }
+        .message-content {
+            color: #333;
+            font-size: 0.9rem;
+            margin-top: 3px;
+            word-break: break-word;
+        }
+        .empty-message {
+            text-align: center;
+            padding: 30px;
+            color: #999;
+        }
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .quick-action-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            color: #495057;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+        .quick-action-btn:hover {
+            background: #007bff;
+            color: #fff;
+            border-color: #007bff;
+        }
+        .performance-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }
+        .metric-item {
+            text-align: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .metric-label {
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 5px;
+        }
+        @media (max-width: 1200px) {
+            .stat-cards { grid-template-columns: repeat(2, 1fr); }
+            .dashboard-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 768px) {
+            .stat-cards { grid-template-columns: 1fr; }
+        }
+    </style>
 </head>
 <body>
     <nav class="sidebar">
         <h1>Clawdbot</h1>
         <ul>
-            <li><a href="/">首页</a></li>
+            <li><a href="/" class="active">首页</a></li>
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
@@ -1614,10 +1983,187 @@ const HTML_INDEX: &str = r#"
         </div>
     </nav>
     <main>
-        <h1>欢迎使用 Clawdbot</h1>
-        <p>选择左侧菜单开始使用</p>
+        <div class="dashboard-header">
+            <h1>Clawdbot 仪表盘</h1>
+            <div class="header-actions">
+                <button onclick="refreshDashboard()" class="refresh-btn">刷新数据</button>
+            </div>
+        </div>
+
+        <!-- 统计卡片区 -->
+        <div class="stat-cards">
+            <div class="stat-card service">
+                <div class="stat-icon">🟢</div>
+                <div class="stat-status" id="serviceStatusIndicator"></div>
+                <div class="stat-value" id="serviceStatusText">初始化中</div>
+                <div class="stat-label">服务状态</div>
+            </div>
+            <div class="stat-card messages">
+                <div class="stat-icon">💬</div>
+                <div class="stat-value" id="todayMessages">0</div>
+                <div class="stat-label">今日消息</div>
+            </div>
+            <div class="stat-card sessions">
+                <div class="stat-icon">👥</div>
+                <div class="stat-value" id="activeSessions">0</div>
+                <div class="stat-label">活跃会话</div>
+            </div>
+            <div class="stat-card ai">
+                <div class="stat-icon">🤖</div>
+                <div class="stat-value" id="aiSuccessRate">--%</div>
+                <div class="stat-label">AI 成功率</div>
+            </div>
+        </div>
+
+        <!-- 主体网格 -->
+        <div class="dashboard-grid">
+            <!-- 渠道状态 -->
+            <div class="dashboard-section">
+                <h2>📡 渠道连接状态</h2>
+                <div class="channel-list" id="channelList">
+                    <div class="empty-message">加载中...</div>
+                </div>
+            </div>
+
+            <!-- 最近消息 -->
+            <div class="dashboard-section">
+                <h2>💬 最近消息</h2>
+                <div class="message-list" id="recentMessages">
+                    <div class="empty-message">暂无消息</div>
+                </div>
+            </div>
+
+            <!-- 性能指标 -->
+            <div class="dashboard-section">
+                <h2>⚡ 性能指标</h2>
+                <div class="performance-metrics">
+                    <div class="metric-item">
+                        <div class="metric-value" id="avgResponseTime">--ms</div>
+                        <div class="metric-label">平均响应时间</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-value" id="todayTokens">0</div>
+                        <div class="metric-label">今日 Token</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-value" id="aiRequests">0</div>
+                        <div class="metric-label">AI 请求数</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 快捷操作 -->
+            <div class="dashboard-section">
+                <h2>🚀 快捷操作</h2>
+                <div class="quick-actions">
+                    <a href="/debug" class="quick-action-btn">📊 查看统计</a>
+                    <a href="/config" class="quick-action-btn">⚙️ 配置管理</a>
+                    <a href="/audit" class="quick-action-btn">📜 审计日志</a>
+                    <a href="/operations" class="quick-action-btn">📈 运营数据</a>
+                </div>
+            </div>
+        </div>
     </main>
     <script src="/static/app.js"></script>
+    <script>
+        // 加载仪表盘数据
+        async function loadDashboard() {
+            try {
+                const response = await fetch('/api/dashboard/stats');
+                const data = await response.json();
+
+                // 更新服务状态
+                const statusIndicator = document.getElementById('serviceStatusIndicator');
+                const statusText = document.getElementById('serviceStatusText');
+                if (data.service_status === 'running') {
+                    statusIndicator.className = 'stat-status running';
+                    statusText.textContent = '运行中';
+                } else if (data.service_status === 'error') {
+                    statusIndicator.className = 'stat-status';
+                    statusText.textContent = '错误';
+                } else {
+                    statusIndicator.className = 'stat-status';
+                    statusText.textContent = data.service_status;
+                }
+
+                // 更新统计卡片
+                document.getElementById('todayMessages').textContent = data.today_messages || 0;
+                document.getElementById('activeSessions').textContent = data.active_sessions || 0;
+                document.getElementById('aiSuccessRate').textContent =
+                    (data.ai_success_rate !== undefined ? data.ai_success_rate.toFixed(1) : '--') + '%';
+
+                // 更新性能指标
+                document.getElementById('avgResponseTime').textContent =
+                    (data.avg_response_time_ms !== undefined ? Math.round(data.avg_response_time_ms) : '--') + 'ms';
+                document.getElementById('todayTokens').textContent = formatNumber(data.today_tokens || 0);
+                document.getElementById('aiRequests').textContent = formatNumber(
+                    (data.ai_success_rate !== undefined && data.ai_success_rate > 0) ?
+                    Math.round(data.today_messages / (data.ai_success_rate / 100)) : 0);
+
+                // 更新渠道状态
+                const channelList = document.getElementById('channelList');
+                if (data.channels && data.channels.length > 0) {
+                    channelList.innerHTML = data.channels.map(ch => `
+                        <div class="channel-item">
+                            <span class="channel-icon">${ch.icon}</span>
+                            <div class="channel-info">
+                                <div class="channel-name">${ch.display_name}</div>
+                                <div class="channel-stats">${ch.message_count || 0} 条消息</div>
+                            </div>
+                            <span class="channel-status ${ch.connected ? 'connected' : 'disconnected'}">
+                                ${ch.connected ? '已连接' : '未连接'}
+                            </span>
+                        </div>
+                    `).join('');
+                } else {
+                    channelList.innerHTML = '<div class="empty-message">暂无渠道配置</div>';
+                }
+
+                // 更新最近消息
+                const recentMessages = document.getElementById('recentMessages');
+                if (data.recent_messages && data.recent_messages.length > 0) {
+                    recentMessages.innerHTML = data.recent_messages.map(msg => `
+                        <div class="message-item">
+                            <span class="message-time">${msg.time}</span>
+                            <div style="flex:1">
+                                <div>
+                                    <span class="message-channel">${msg.channel}</span>
+                                    <span class="message-user">${escapeHtml(msg.user)}</span>
+                                </div>
+                                <div class="message-content">${escapeHtml(msg.content)}</div>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    recentMessages.innerHTML = '<div class="empty-message">暂无消息</div>';
+                }
+            } catch (e) {
+                console.error('加载仪表盘数据失败:', e);
+            }
+        }
+
+        // 刷新仪表盘
+        function refreshDashboard() {
+            loadDashboard();
+        }
+
+        // 格式化数字
+        function formatNumber(num) {
+            if (num >= 1000000) {
+                return (num / 1000000).toFixed(1) + 'M';
+            } else if (num >= 1000) {
+                return (num / 1000).toFixed(1) + 'K';
+            }
+            return num.toString();
+        }
+
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+            // 每30秒自动刷新
+            setInterval(loadDashboard, 30000);
+        });
+    </script>
 </body>
 </html>
 "#;
