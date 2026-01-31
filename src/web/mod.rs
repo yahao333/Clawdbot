@@ -769,24 +769,198 @@ async fn api_status_handler(State(state): State<WebState>) -> Json<JsonValue> {
     }))
 }
 
-// 发送测试消息 - 调用真实 MiniMax AI
+// 发送测试消息 - 发送到渠道并调用 AI
 async fn api_send_message(
     State(state): State<WebState>,
     Json(req): Json<SendMessageRequest>,
 ) -> Json<SendMessageResponse> {
     info!(channel = %req.channel, target = %req.target_id, message = %req.message, "收到测试消息请求");
 
-    // 调用 MiniMax AI
-    let ai_response = call_minimax_ai(&req.message).await;
+    // 根据渠道发送消息
+    match req.channel.as_str() {
+        "feishu" => {
+            // 创建飞书客户端并发送消息
+            match send_feishu_message(&req.target_id, &req.message).await {
+                Ok(msg_id) => {
+                    info!(message_id = %msg_id, "飞书消息发送成功");
 
-    match ai_response {
+                    // 调用 AI 生成响应
+                    let ai_response = call_minimax_ai(&req.message, None, None).await;
+
+                    match ai_response {
+                        Ok(response) => {
+                            // 记录到历史
+                            let mut history = state.conversation_history.write().await;
+                            history.push(Conversation {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                channel: req.channel.clone(),
+                                user_id: req.target_id.clone(),
+                                user_name: None,
+                                message: req.message.clone(),
+                                response: response.content.clone(),
+                                tokens: response.usage.total_tokens,
+                                timestamp: chrono::Utc::now(),
+                            });
+
+                            // 更新统计
+                            let mut stats = state.message_stats.write().await;
+                            stats.total_messages += 1;
+                            stats.today_messages += 1;
+                            stats.total_tokens += response.usage.total_tokens as u64;
+                            stats.today_tokens += response.usage.total_tokens as u64;
+                            stats.feishu_messages += 1;
+
+                            Json(SendMessageResponse {
+                                success: true,
+                                message_id: Some(msg_id),
+                                response: Some(response.content),
+                                error: None,
+                            })
+                        }
+                        Err(e) => {
+                            error!(error = %e, "AI 调用失败");
+                            Json(SendMessageResponse {
+                                success: false,
+                                message_id: Some(msg_id),
+                                response: None,
+                                error: Some(format!("消息已发送，但 AI 调用失败: {}", e)),
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "飞书消息发送失败");
+                    Json(SendMessageResponse {
+                        success: false,
+                        message_id: None,
+                        response: None,
+                        error: Some(format!("飞书消息发送失败: {}", e)),
+                    })
+                }
+            }
+        }
+        "telegram" | "discord" => {
+            // TODO: 实现 Telegram/Discord 发送
+            error!(channel = %req.channel, "渠道发送暂未实现");
+            Json(SendMessageResponse {
+                success: false,
+                message_id: None,
+                response: None,
+                error: Some(format!("渠道 {} 发送功能暂未实现", req.channel)),
+            })
+        }
+        _ => {
+            error!(channel = %req.channel, "不支持的渠道");
+            Json(SendMessageResponse {
+                success: false,
+                message_id: None,
+                response: None,
+                error: Some(format!("不支持的渠道: {}", req.channel)),
+            })
+        }
+    }
+}
+
+/// 发送飞书消息
+async fn send_feishu_message(target_id: &str, message: &str) -> Result<String, String> {
+    use crate::channels::feishu::send::{FeishuMessageSender, MessageReceiver};
+    use crate::channels::feishu::client::FeishuClient;
+
+    // 从环境变量加载飞书配置
+    let app_id = std::env::var("FEISHU_APP_ID")
+        .map_err(|_| "FEISHU_APP_ID 未设置")?;
+    let app_secret = std::env::var("FEISHU_APP_SECRET")
+        .map_err(|_| "FEISHU_APP_SECRET 未设置")?;
+
+    info!(target_id = %target_id, "创建飞书客户端并发送消息");
+
+    // 创建凭据和客户端
+    let credentials = FeishuClient::new(crate::channels::feishu::client::FeishuCredentials {
+        app_id,
+        app_secret,
+        verification_token: None,
+        encrypt_key: None,
+    });
+    let sender = FeishuMessageSender::from_client(credentials);
+
+    // 确定接收者类型
+    let receiver = if target_id.starts_with("ou_") {
+        MessageReceiver::OpenId(target_id.to_string())
+    } else if target_id.starts_with("oc_") {
+        MessageReceiver::ChatId(target_id.to_string())
+    } else {
+        // 默认当作 Open ID 处理
+        MessageReceiver::OpenId(target_id.to_string())
+    };
+
+    // 发送文本消息
+    let response = sender.send_text(&receiver, message)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(response.message_id)
+}
+
+/// 大模型测试请求
+#[derive(Debug, Deserialize)]
+pub struct AiTestRequest {
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub system_prompt: Option<String>,
+    pub message: String,
+}
+
+/// 大模型测试响应
+#[derive(Debug, Serialize)]
+pub struct AiTestResponse {
+    pub success: bool,
+    pub response: Option<String>,
+    pub usage: Option<TokenUsageInfo>,
+    pub response_time_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenUsageInfo {
+    pub total_tokens: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+/// 大模型测试 API
+async fn api_ai_test(
+    State(state): State<WebState>,
+    Json(req): Json<AiTestRequest>,
+) -> Json<AiTestResponse> {
+    info!(model = %req.model, temperature = ?req.temperature, "收到大模型测试请求");
+
+    let start_time = std::time::Instant::now();
+
+    // 根据选择的模型调用对应的 AI
+    let result = match req.model.as_str() {
+        "minimax" => {
+            call_minimax_ai(&req.message, req.temperature, req.max_tokens).await
+        }
+        "openai" => {
+            call_openai_ai(&req.message, req.temperature, req.max_tokens).await
+        }
+        "anthropic" => {
+            call_anthropic_ai(&req.message, req.temperature, req.max_tokens).await
+        }
+        _ => Err(format!("不支持的模型: {}", req.model)),
+    };
+
+    let response_time_ms = start_time.elapsed().as_millis() as u64;
+
+    match result {
         Ok(response) => {
             // 记录到历史
             let mut history = state.conversation_history.write().await;
             history.push(Conversation {
                 id: uuid::Uuid::new_v4().to_string(),
-                channel: req.channel.clone(),
-                user_id: req.target_id.clone(),
+                channel: "debug_ai".to_string(),
+                user_id: req.model.clone(),
                 user_name: None,
                 message: req.message.clone(),
                 response: response.content.clone(),
@@ -801,19 +975,25 @@ async fn api_send_message(
             stats.total_tokens += response.usage.total_tokens as u64;
             stats.today_tokens += response.usage.total_tokens as u64;
 
-            Json(SendMessageResponse {
+            Json(AiTestResponse {
                 success: true,
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 response: Some(response.content),
+                usage: Some(TokenUsageInfo {
+                    total_tokens: response.usage.total_tokens,
+                    prompt_tokens: response.usage.prompt_tokens,
+                    completion_tokens: response.usage.completion_tokens,
+                }),
+                response_time_ms: Some(response_time_ms),
                 error: None,
             })
         }
         Err(e) => {
             error!(error = %e, "AI 调用失败");
-            Json(SendMessageResponse {
+            Json(AiTestResponse {
                 success: false,
-                message_id: None,
                 response: None,
+                usage: None,
+                response_time_ms: Some(response_time_ms),
                 error: Some(e.to_string()),
             })
         }
@@ -821,7 +1001,11 @@ async fn api_send_message(
 }
 
 /// 调用 MiniMax AI
-async fn call_minimax_ai(message: &str) -> Result<super::ai::provider::ChatResponse, String> {
+async fn call_minimax_ai(
+    message: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> Result<super::ai::provider::ChatResponse, String> {
     use super::ai::provider::AiProvider;
 
     // 从环境变量加载配置
@@ -831,24 +1015,28 @@ async fn call_minimax_ai(message: &str) -> Result<super::ai::provider::ChatRespo
         .unwrap_or_else(|_| "default".to_string());
     let model = std::env::var("MINIMAX_MODEL")
         .unwrap_or_else(|_| "MiniMax-M2.1".to_string());
-    let temperature = std::env::var("MINIMAX_TEMPERATURE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.7);
-    let max_tokens = std::env::var("MINIMAX_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4096);
+    let temp = temperature.unwrap_or_else(|| {
+        std::env::var("MINIMAX_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.7)
+    });
+    let mt = max_tokens.unwrap_or_else(|| {
+        std::env::var("MINIMAX_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096)
+    });
 
-    info!(model = %model, "使用 MiniMax 模型");
+    info!(model = %model, temperature = temp, max_tokens = mt, "使用 MiniMax 模型");
 
     // 创建 MiniMax 配置
     let config = super::ai::provider::minimax::MiniMaxConfig {
         api_key,
         group_id,
         model: Some(model.clone()),
-        temperature: Some(temperature),
-        max_tokens: Some(max_tokens),
+        temperature: Some(temp),
+        max_tokens: Some(mt),
         base_url: None,
     };
 
@@ -862,8 +1050,124 @@ async fn call_minimax_ai(message: &str) -> Result<super::ai::provider::ChatRespo
             model: model.clone(),
             api_key: None,
             base_url: None,
-            temperature: Some(temperature),
-            max_tokens: Some(max_tokens),
+            temperature: Some(temp),
+            max_tokens: Some(mt),
+            system_prompt: None,
+        },
+        messages: vec![super::ai::provider::ChatMessage {
+            role: super::ai::provider::MessageRole::User,
+            content: message.to_string(),
+            name: None,
+        }],
+        tools: vec![],
+        stream: false,
+    };
+
+    // 调用 AI（通过 trait 对象）
+    let provider: &dyn AiProvider = &provider;
+    provider.chat(&request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 调用 OpenAI AI
+async fn call_openai_ai(
+    message: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> Result<super::ai::provider::ChatResponse, String> {
+    use super::ai::provider::AiProvider;
+
+    // 从环境变量加载配置
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY 未设置")?;
+    let model = std::env::var("OPENAI_MODEL")
+        .unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
+    let temp = temperature.unwrap_or(0.7);
+    let mt = max_tokens.unwrap_or(4096);
+
+    info!(model = %model, temperature = temp, max_tokens = mt, "使用 OpenAI 模型");
+
+    // 创建 OpenAI 配置
+    let config = super::ai::provider::openai::OpenAIConfig {
+        api_key,
+        model: Some(model.clone()),
+        temperature: Some(temp),
+        max_tokens: Some(mt),
+        base_url: None,
+        organization_id: None,
+    };
+
+    // 创建 Provider
+    let provider = super::ai::provider::openai::OpenAIProvider::new(config);
+
+    // 构建请求
+    let request = super::ai::provider::ChatRequest {
+        model: super::ai::provider::ModelConfig {
+            provider: "openai".to_string(),
+            model: model.clone(),
+            api_key: None,
+            base_url: None,
+            temperature: Some(temp),
+            max_tokens: Some(mt),
+            system_prompt: None,
+        },
+        messages: vec![super::ai::provider::ChatMessage {
+            role: super::ai::provider::MessageRole::User,
+            content: message.to_string(),
+            name: None,
+        }],
+        tools: vec![],
+        stream: false,
+    };
+
+    // 调用 AI（通过 trait 对象）
+    let provider: &dyn AiProvider = &provider;
+    provider.chat(&request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 调用 Anthropic AI
+async fn call_anthropic_ai(
+    message: &str,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> Result<super::ai::provider::ChatResponse, String> {
+    use super::ai::provider::AiProvider;
+
+    // 从环境变量加载配置
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY 未设置")?;
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+    let temp = temperature.unwrap_or(0.7);
+    let mt = max_tokens.unwrap_or(4096);
+
+    info!(model = %model, temperature = temp, max_tokens = mt, "使用 Anthropic 模型");
+
+    // 创建 Anthropic 配置
+    let config = super::ai::provider::anthropic::AnthropicConfig {
+        api_key,
+        model: Some(model.clone()),
+        temperature: Some(temp),
+        max_tokens: Some(mt),
+        base_url: None,
+        api_version: Some("2023-06-01".to_string()),
+    };
+
+    // 创建 Provider
+    let provider = super::ai::provider::anthropic::AnthropicProvider::new(config);
+
+    // 构建请求
+    let request = super::ai::provider::ChatRequest {
+        model: super::ai::provider::ModelConfig {
+            provider: "anthropic".to_string(),
+            model: model.clone(),
+            api_key: None,
+            base_url: None,
+            temperature: Some(temp),
+            max_tokens: Some(mt),
             system_prompt: None,
         },
         messages: vec![super::ai::provider::ChatMessage {
@@ -1222,6 +1526,7 @@ impl WebServer {
             .route("/audit", get(audit_handler))
             // API - 调试监控
             .route("/api/debug/send", post(api_send_message))
+            .route("/api/debug/ai", post(api_ai_test))
             .route("/api/debug/history", get(api_conversation_history))
             .route("/api/debug/stats", get(api_stats))
             .route("/api/debug/clear", post(api_clear_history))
@@ -1344,28 +1649,69 @@ const HTML_DEBUG: &str = r#"
     <main>
         <h1>调试监控</h1>
 
+        <!-- 大模型调试 -->
         <section class="card">
-            <h2>发送测试消息</h2>
-            <form id="sendForm">
-                <div class="form-group">
-                    <label>渠道</label>
-                    <select id="channel" name="channel">
-                        <option value="feishu">飞书</option>
-                    </select>
+            <h2>大模型调试</h2>
+            <form id="aiTestForm">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>模型</label>
+                        <select id="aiModel" name="model">
+                            <option value="minimax">MiniMax</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Temperature</label>
+                        <input type="number" id="aiTemperature" name="temperature" value="0.7" step="0.1" min="0" max="2">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Tokens</label>
+                        <input type="number" id="aiMaxTokens" name="maxTokens" value="4096" step="100">
+                    </div>
                 </div>
                 <div class="form-group">
-                    <label>目标 ID</label>
-                    <input type="text" id="targetId" name="targetId" placeholder="用户或群组 ID">
+                    <label>系统提示词</label>
+                    <textarea id="aiSystemPrompt" name="systemPrompt" rows="2" placeholder="可选的系统提示词"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>用户消息</label>
+                    <textarea id="aiMessage" name="message" rows="3" placeholder="输入测试消息"></textarea>
+                </div>
+                <button type="submit">调用大模型</button>
+            </form>
+            <div id="aiResult" class="result-box"></div>
+        </section>
+
+        <!-- 渠道调试 -->
+        <section class="card">
+            <h2>渠道调试</h2>
+            <form id="channelTestForm">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>渠道</label>
+                        <select id="channel" name="channel">
+                            <option value="feishu">飞书</option>
+                            <option value="telegram">Telegram</option>
+                            <option value="discord">Discord</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label>目标 ID</label>
+                        <input type="text" id="targetId" name="targetId" placeholder="用户 ID 或群组 ID">
+                    </div>
                 </div>
                 <div class="form-group">
                     <label>消息内容</label>
-                    <textarea id="message" name="message" rows="3" placeholder="输入测试消息"></textarea>
+                    <textarea id="channelMessage" name="message" rows="3" placeholder="输入要发送的消息"></textarea>
                 </div>
-                <button type="submit">发送</button>
+                <button type="submit">发送消息</button>
             </form>
-            <div id="sendResult"></div>
+            <div id="channelResult" class="result-box"></div>
         </section>
 
+        <!-- 统计概览 -->
         <section class="card">
             <h2>统计概览</h2>
             <div class="stats-grid">
@@ -1388,6 +1734,7 @@ const HTML_DEBUG: &str = r#"
             </div>
         </section>
 
+        <!-- 对话历史 -->
         <section class="card">
             <h2>对话历史 <button onclick="clearHistory()" class="btn-small">清空</button></h2>
             <div id="historyList"></div>
@@ -1699,6 +2046,18 @@ button:hover { background: #0056b3; }
 /* 退出登录按钮 */
 .logout-btn { width: 100%; background: #dc3545; color: #fff; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; }
 .logout-btn:hover { background: #c82333; }
+
+/* 表单行布局 */
+.form-row { display: flex; gap: 15px; }
+.form-row .form-group { flex: 1; margin-bottom: 15px; }
+
+/* 结果展示框 */
+.result-box { margin-top: 15px; padding: 15px; border-radius: 4px; background: #f8f9fa; border: 1px solid #ddd; }
+.result-box.success { background: #d4edda; color: #155724; border-color: #c3e6cb; }
+.result-box.error { background: #f8d7da; color: #721c24; border-color: #f5c6cb; }
+.result-box.loading { background: #fff3cd; color: #856404; border-color: #ffeeba; }
+.result-box pre { white-space: pre-wrap; word-wrap: break-word; margin: 10px 0 0 0; font-family: monospace; font-size: 13px; }
+.result-meta { font-size: 12px; color: #666; margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd; }
 "#;
 
 // JavaScript
@@ -1711,29 +2070,89 @@ async function api(url, options = {}) {
     return response.json();
 }
 
-// 发送消息
-document.getElementById('sendForm')?.addEventListener('submit', async (e) => {
+// 大模型调试 - 调用大模型
+document.getElementById('aiTestForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const model = document.getElementById('aiModel').value;
+    const temperature = parseFloat(document.getElementById('aiTemperature').value) || 0.7;
+    const maxTokens = parseInt(document.getElementById('aiMaxTokens').value) || 4096;
+    const systemPrompt = document.getElementById('aiSystemPrompt').value;
+    const message = document.getElementById('aiMessage').value;
+
+    const resultDiv = document.getElementById('aiResult');
+    resultDiv.className = 'result-box loading';
+    resultDiv.innerHTML = '正在调用大模型...';
+
+    try {
+        const result = await api('/api/debug/ai', {
+            method: 'POST',
+            body: JSON.stringify({model, temperature, max_tokens: maxTokens, system_prompt: systemPrompt, message})
+        });
+
+        if (result.success) {
+            resultDiv.className = 'result-box success';
+            let html = '<strong>响应：</strong>';
+            html += '<pre>' + escapeHtml(result.response) + '</pre>';
+            if (result.usage) {
+                html += '<div class="result-meta">';
+                html += 'Token: ' + result.usage.total_tokens + ' (输入: ' + result.usage.prompt_tokens + ', 输出: ' + result.usage.completion_tokens + ')';
+                html += ' | 耗时: ' + (result.response_time_ms || 0) + 'ms';
+                html += '</div>';
+            }
+            resultDiv.innerHTML = html;
+        } else {
+            resultDiv.className = 'result-box error';
+            resultDiv.innerHTML = '<strong>错误：</strong><pre>' + escapeHtml(result.error) + '</pre>';
+        }
+    } catch (e) {
+        resultDiv.className = 'result-box error';
+        resultDiv.innerHTML = '<strong>异常：</strong><pre>' + escapeHtml(e.message) + '</pre>';
+    }
+});
+
+// 渠道调试 - 发送消息
+document.getElementById('channelTestForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const channel = document.getElementById('channel').value;
     const targetId = document.getElementById('targetId').value;
-    const message = document.getElementById('message').value;
+    const message = document.getElementById('channelMessage').value;
 
-    const result = await api('/api/debug/send', {
-        method: 'POST',
-        body: JSON.stringify({channel, target_id: targetId, message})
-    });
+    const resultDiv = document.getElementById('channelResult');
+    resultDiv.className = 'result-box loading';
+    resultDiv.innerHTML = '正在发送消息...';
 
-    const resultDiv = document.getElementById('sendResult');
-    if (result.success) {
-        resultDiv.className = 'success';
-        resultDiv.innerHTML = '发送成功！响应：' + result.response;
-        loadHistory();
-        loadStats();
-    } else {
-        resultDiv.className = 'error';
-        resultDiv.innerHTML = '失败：' + result.error;
+    try {
+        const result = await api('/api/debug/send', {
+            method: 'POST',
+            body: JSON.stringify({channel, target_id: targetId, message})
+        });
+
+        if (result.success) {
+            resultDiv.className = 'result-box success';
+            let html = '<strong>发送成功！</strong>';
+            if (result.message_id) {
+                html += '<div class="result-meta">消息ID: ' + result.message_id + '</div>';
+            }
+            resultDiv.innerHTML = html;
+            loadHistory();
+            loadStats();
+        } else {
+            resultDiv.className = 'result-box error';
+            resultDiv.innerHTML = '<strong>发送失败：</strong><pre>' + escapeHtml(result.error) + '</pre>';
+        }
+    } catch (e) {
+        resultDiv.className = 'result-box error';
+        resultDiv.innerHTML = '<strong>异常：</strong><pre>' + escapeHtml(e.message) + '</pre>';
     }
 });
+
+// HTML 转义
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
 
 // 加载统计
 async function loadStats() {
@@ -1752,7 +2171,7 @@ async function loadHistory() {
         container.innerHTML = '<p>暂无对话记录</p>';
         return;
     }
-    container.innerHTML = history.map(h => '<div class="history-item"><div class="timestamp">' + new Date(h.timestamp).toLocaleString() + '</div><div><span class="msg-user">[' + h.channel + ']</span>: ' + h.message + '</div><div class="msg-bot">→ ' + h.response + '</div></div>').join('');
+    container.innerHTML = history.map(h => '<div class="history-item"><div class="timestamp">' + new Date(h.timestamp).toLocaleString() + '</div><div><span class="msg-user">[' + h.channel + ']</span>: ' + escapeHtml(h.message) + '</div><div class="msg-bot">→ ' + escapeHtml(h.response) + '</div></div>').join('');
 }
 
 // 清除历史
