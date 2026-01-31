@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub mod openai;
 pub mod minimax;
+pub mod deepseek;
 
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};

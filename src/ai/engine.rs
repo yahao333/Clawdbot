@@ -150,6 +150,18 @@ impl AiEngine {
                     registry.register(provider);
                     info!(provider = %name, "MiniMax Provider 注册成功");
                 }
+                "deepseek" => {
+                    let config = super::provider::deepseek::DeepSeekConfig {
+                        api_key: provider_config.api_key.clone().unwrap_or_default(),
+                        base_url: provider_config.base_url.clone(),
+                        model: provider_config.model.clone(),
+                        temperature: provider_config.temperature,
+                        max_tokens: provider_config.max_tokens,
+                    };
+                    let provider = super::provider::deepseek::DeepSeekProvider::new(config);
+                    registry.register(provider);
+                    info!(provider = %name, "DeepSeek Provider 注册成功");
+                }
                 _ => {
                     warn!(provider = %name, "未支持的 Provider 类型");
                 }
