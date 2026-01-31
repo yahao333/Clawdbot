@@ -76,6 +76,8 @@ uuid = { version = "1.6", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 # regex：正则表达式
 regex = "1.10"
+# dirs：获取系统目录（用于存储审计日志）
+dirs = "5"
 # lazy_static：静态变量延迟初始化
 lazy_static = "1.4"
 # dashmap：高性能并发 HashMap
@@ -100,6 +102,10 @@ base64 = "0.22"
 hmac = "0.12"
 # sha2：SHA256 哈希（用于飞书签名验证）
 sha2 = "0.10"
+# native-tls：TLS 加密（用于 SMTP 邮件告警）
+native-tls = "0.2"
+# humantime：人类可读的时间格式
+humantime = "2.1"
 
 # ==================== 开发依赖 ====================
 

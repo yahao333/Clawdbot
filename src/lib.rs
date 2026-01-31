@@ -19,3 +19,5 @@ pub mod extensions;
 pub mod utils;
 pub mod service;
 pub mod web;
+/// 安全审计模块
+pub mod security;

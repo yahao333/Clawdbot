@@ -5,15 +5,17 @@
 use axum::{
     routing::{get, post, put},
     Router,
-    extract::State,
+    extract::{State, Query},
     response::{Html, IntoResponse},
     Json,
 };
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{info, error};
 use serde::{Serialize, Deserialize};
 use serde_json::{Value as JsonValue, json};
+use std::collections::HashMap;
 
 // ==================== 类型定义 ====================
 
@@ -27,6 +29,8 @@ pub struct WebState {
     /// 配置
     #[allow(dead_code)]
     pub config: Arc<tokio::sync::Mutex<Option<super::infra::config::Config>>>,
+    /// 审计服务（可选）
+    pub audit_service: Arc<RwLock<Option<super::security::AuditService>>>,
 }
 
 /// 消息统计
@@ -293,6 +297,154 @@ async fn api_user_stats() -> Json<JsonValue> {
     }))
 }
 
+// 审计管理页面
+async fn audit_handler() -> Html<&'static str> {
+    Html(HTML_AUDIT)
+}
+
+// ==================== 审计 API ====================
+
+/// 审计日志查询参数
+#[derive(Debug, Deserialize)]
+pub struct AuditQueryParams {
+    pub start_time: Option<u64>, // Unix timestamp
+    pub end_time: Option<u64>,   // Unix timestamp
+    pub level: Option<String>,
+    pub channel: Option<String>,
+    pub user_id: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// 获取审计统计
+async fn api_audit_stats(State(state): State<WebState>) -> Json<JsonValue> {
+    let audit_guard = state.audit_service.read().await;
+    if let Some(audit_service) = &*audit_guard {
+        match audit_service.get_stats().await {
+            Ok(stats) => Json(json!({
+                "success": true,
+                "stats": {
+                    "total_events": stats.total_events,
+                    "today_events": stats.today_events,
+                    "warning_events": stats.warning_events,
+                    "error_events": stats.error_events,
+                    "by_level": stats.by_level,
+                    "by_category": stats.by_category,
+                    "by_channel": stats.by_channel,
+                }
+            })),
+            Err(e) => Json(json!({
+                "success": false,
+                "error": e.to_string()
+            })),
+        }
+    } else {
+        Json(json!({
+            "success": false,
+            "error": "审计服务未启用"
+        }))
+    }
+}
+
+/// 查询审计日志
+async fn api_audit_logs(
+    State(state): State<WebState>,
+    Query(params): Query<AuditQueryParams>,
+) -> Json<JsonValue> {
+    let audit_guard = state.audit_service.read().await;
+    if let Some(audit_service) = &*audit_guard {
+        let now = SystemTime::now();
+        let start_time = params.start_time
+            .map(|ts| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(ts))
+            .unwrap_or(now - std::time::Duration::from_secs(24 * 60 * 60)); // 默认 24 小时
+        let end_time = params.end_time
+            .map(|ts| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(ts))
+            .unwrap_or(now);
+
+        let level = params.level.as_ref().and_then(|l| {
+            match l.to_uppercase().as_str() {
+                "DEBUG" => Some(super::security::AuditLevel::Debug),
+                "INFO" => Some(super::security::AuditLevel::Info),
+                "WARNING" => Some(super::security::AuditLevel::Warning),
+                "ERROR" => Some(super::security::AuditLevel::Error),
+                "CRITICAL" => Some(super::security::AuditLevel::Critical),
+                _ => None,
+            }
+        });
+
+        match audit_service.export_logs(start_time, end_time, level).await {
+            Ok(json_data) => Json(json!({
+                "success": true,
+                "logs": serde_json::from_str::<Vec<JsonValue>>(&json_data).unwrap_or_default()
+            })),
+            Err(e) => Json(json!({
+                "success": false,
+                "error": e.to_string()
+            })),
+        }
+    } else {
+        Json(json!({
+            "success": false,
+            "error": "审计服务未启用"
+        }))
+    }
+}
+
+/// 导出审计日志
+async fn api_audit_export(
+    State(state): State<WebState>,
+    Query(params): Query<AuditQueryParams>,
+) -> axum::response::Response {
+    let audit_guard = state.audit_service.read().await;
+    if let Some(audit_service) = &*audit_guard {
+        let now = SystemTime::now();
+        let start_time = params.start_time
+            .map(|ts| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(ts))
+            .unwrap_or(now - std::time::Duration::from_secs(30 * 24 * 60 * 60)); // 默认 30 天
+        let end_time = params.end_time
+            .map(|ts| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(ts))
+            .unwrap_or(now);
+
+        match audit_service.export_logs(start_time, end_time, None).await {
+            Ok(json_data) => {
+                let response = axum::response::Json(json_data);
+                let mut resp = response.into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"audit_logs.json\"".parse().unwrap()
+                );
+                resp
+            }
+            Err(e) => {
+                axum::response::Json(json!({"error": e.to_string()})).into_response()
+            }
+        }
+    } else {
+        axum::response::Json(json!({"error": "审计服务未启用"})).into_response()
+    }
+}
+
+/// 清理过期审计日志
+async fn api_audit_cleanup(State(state): State<WebState>) -> Json<JsonValue> {
+    let audit_guard = state.audit_service.write().await;
+    if let Some(audit_service) = &*audit_guard {
+        match audit_service.cleanup_expired_logs().await {
+            Ok(count) => Json(json!({
+                "success": true,
+                "deleted_count": count
+            })),
+            Err(e) => Json(json!({
+                "success": false,
+                "error": e.to_string()
+            })),
+        }
+    } else {
+        Json(json!({
+            "success": false,
+            "error": "审计服务未启用"
+        }))
+    }
+}
+
 // ==================== Web 服务器 ====================
 
 /// Web 服务器
@@ -313,8 +465,15 @@ impl WebServer {
                 message_stats: Arc::new(RwLock::new(MessageStats::default())),
                 conversation_history: Arc::new(RwLock::new(Vec::new())),
                 config: Arc::new(tokio::sync::Mutex::new(None)),
+                audit_service: Arc::new(RwLock::new(None)),
             },
         }
+    }
+
+    /// 设置审计服务
+    pub fn set_audit_service(&self, audit_service: super::security::AuditService) {
+        let mut guard = futures::executor::block_on(self.state.audit_service.write());
+        *guard = Some(audit_service);
     }
 
     /// 获取状态
@@ -330,6 +489,7 @@ impl WebServer {
             .route("/debug", get(debug_handler))
             .route("/config", get(config_handler))
             .route("/operations", get(operations_handler))
+            .route("/audit", get(audit_handler))
             // API - 调试监控
             .route("/api/debug/send", post(api_send_message))
             .route("/api/debug/history", get(api_conversation_history))
@@ -344,6 +504,11 @@ impl WebServer {
             .route("/api/operations/sessions", get(api_active_sessions))
             .route("/api/operations/messages", get(api_message_history))
             .route("/api/operations/users", get(api_user_stats))
+            // API - 审计管理
+            .route("/api/audit/stats", get(api_audit_stats))
+            .route("/api/audit/logs", get(api_audit_logs))
+            .route("/api/audit/export", get(api_audit_export))
+            .route("/api/audit/cleanup", post(api_audit_cleanup))
             // 静态资源
             .route("/static/style.css", get(static_style_css))
             .route("/static/app.js", get(static_app_js))
@@ -567,6 +732,165 @@ const HTML_OPERATIONS: &str = r#"
         </section>
     </main>
     <script src="/static/app.js"></script>
+</body>
+</html>
+"#;
+
+// 安全审计页面
+const HTML_AUDIT: &str = r#"
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>安全审计 - Clawdbot</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        .audit-level { padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+        .level-debug { background: #e9ecef; color: #495057; }
+        .level-info { background: #cce5ff; color: #004085; }
+        .level-warning { background: #fff3cd; color: #856404; }
+        .level-error { background: #f8d7da; color: #721c24; }
+        .level-critical { background: #dc3545; color: #fff; }
+        .log-table { width: 100%; border-collapse: collapse; }
+        .log-table th, .log-table td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+        .log-table th { background: #f8f9fa; font-weight: 600; }
+        .log-table tr:hover { background: #f8f9fa; }
+        .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .filter-bar select, .filter-bar input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .export-btn { background: #28a745; }
+        .cleanup-btn { background: #dc3545; }
+    </style>
+</head>
+<body>
+    <nav class="sidebar">
+        <h1>Clawdbot</h1>
+        <ul>
+            <li><a href="/">首页</a></li>
+            <li><a href="/debug">调试监控</a></li>
+            <li><a href="/config">配置管理</a></li>
+            <li><a href="/operations">运营数据</a></li>
+            <li><a href="/audit" class="active">安全审计</a></li>
+        </ul>
+    </nav>
+    <main>
+        <h1>安全审计</h1>
+
+        <section class="card">
+            <h2>审计统计</h2>
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <span class="stat-value" id="totalEvents">0</span>
+                    <span class="stat-label">总事件数</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-value" id="todayEvents">0</span>
+                    <span class="stat-label">今日事件</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-value" id="warningEvents">0</span>
+                    <span class="stat-label">警告事件</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-value" id="errorEvents">0</span>
+                    <span class="stat-label">错误事件</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>
+                审计日志
+                <button onclick="exportLogs()" class="btn-small export-btn">导出 JSON</button>
+                <button onclick="cleanupLogs()" class="btn-small cleanup-btn">清理过期</button>
+            </h2>
+            <div class="filter-bar">
+                <select id="filterLevel">
+                    <option value="">所有级别</option>
+                    <option value="DEBUG">调试</option>
+                    <option value="INFO">信息</option>
+                    <option value="WARNING">警告</option>
+                    <option value="ERROR">错误</option>
+                    <option value="CRITICAL">严重</option>
+                </select>
+                <input type="text" id="filterChannel" placeholder="渠道筛选">
+                <input type="text" id="filterUser" placeholder="用户筛选">
+                <button onclick="loadLogs()">查询</button>
+            </div>
+            <div id="logsTable"></div>
+        </section>
+    </main>
+    <script src="/static/app.js"></script>
+    <script>
+// 加载审计统计
+async function loadAuditStats() {
+    const result = await api('/api/audit/stats');
+    if (result.success) {
+        document.getElementById('totalEvents').textContent = result.stats.total_events || 0;
+        document.getElementById('todayEvents').textContent = result.stats.today_events || 0;
+        document.getElementById('warningEvents').textContent = result.stats.warning_events || 0;
+        document.getElementById('errorEvents').textContent = result.stats.error_events || 0;
+    }
+}
+
+// 加载审计日志
+async function loadLogs() {
+    const level = document.getElementById('filterLevel').value;
+    const channel = document.getElementById('filterChannel').value;
+    const user = document.getElementById('filterUser').value;
+
+    let url = '/api/audit/logs?';
+    if (level) url += 'level=' + level + '&';
+    if (channel) url += 'channel=' + encodeURIComponent(channel) + '&';
+    if (user) url += 'user_id=' + encodeURIComponent(user) + '&';
+
+    const result = await api(url);
+    const container = document.getElementById('logsTable');
+
+    if (result.success && result.logs.length > 0) {
+        let html = '<table class="log-table"><thead><tr><th>时间</th><th>级别</th><th>渠道</th><th>用户</th><th>内容</th></tr></thead><tbody>';
+        result.logs.forEach(log => {
+            const levelClass = 'level-' + (log.level || 'info').toLowerCase();
+            html += '<tr>';
+            html += '<td>' + (log.timestamp || '') + '</td>';
+            html += '<td><span class="audit-level ' + levelClass + '">' + (log.level || 'INFO') + '</span></td>';
+            html += '<td>' + (log.channel || '') + '</td>';
+            html += '<td>' + (log.user_id || log.channel || '') + '</td>';
+            html += '<td>' + (log.content || '').substring(0, 100) + '</td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } else {
+        container.innerHTML = '<p>暂无审计日志</p>';
+    }
+}
+
+// 导出审计日志
+async function exportLogs() {
+    window.location.href = '/api/audit/export';
+}
+
+// 清理过期日志
+async function cleanupLogs() {
+    if (confirm('确定要清理 30 天前的审计日志吗？')) {
+        const result = await api('/api/audit/cleanup', {method: 'POST'});
+        if (result.success) {
+            alert('已清理 ' + result.deleted_count + ' 条日志');
+            loadAuditStats();
+            loadLogs();
+        } else {
+            alert('清理失败: ' + result.error);
+        }
+    }
+}
+
+// 页面加载时初始化
+if (document.getElementById('logsTable')) {
+    loadAuditStats();
+    loadLogs();
+}
+    </script>
 </body>
 </html>
 "#;

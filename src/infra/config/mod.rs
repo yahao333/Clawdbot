@@ -19,6 +19,9 @@ pub struct Config {
     /// 日志配置
     #[serde(default)]
     pub logging: LoggingConfigConfig,
+    /// 安全审计配置
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// AI 配置
@@ -65,6 +68,41 @@ pub struct LoggingConfigConfig {
     pub level: Option<String>,
     /// 日志文件路径
     pub file_path: Option<PathBuf>,
+}
+
+/// 安全审计配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// 是否启用审计
+    #[serde(default)]
+    pub enabled: bool,
+    /// 是否存储原始消息内容
+    #[serde(default)]
+    pub audit_store_original: bool,
+    /// 审计日志保留天数
+    #[serde(default)]
+    pub audit_retention_days: Option<u32>,
+    /// 是否启用邮件告警
+    #[serde(default)]
+    pub alert_enabled: bool,
+    /// 邮件告警阈值（每秒事件数）
+    #[serde(default)]
+    pub alert_threshold: Option<u32>,
+    /// SMTP 服务器地址
+    pub smtp_server: Option<String>,
+    /// SMTP 端口
+    pub smtp_port: Option<u16>,
+    /// SMTP 用户名
+    pub smtp_username: Option<String>,
+    /// SMTP 密码
+    pub smtp_password: Option<String>,
+    /// 发件人邮箱
+    pub from_address: Option<String>,
+    /// 收件人邮箱
+    pub to_addresses: Option<Vec<String>>,
+    /// 是否使用 TLS
+    #[serde(default)]
+    pub smtp_tls: bool,
 }
 
 /// 配置加载器

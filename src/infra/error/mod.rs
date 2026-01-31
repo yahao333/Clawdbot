@@ -51,3 +51,9 @@ impl From<std::io::Error> for Error {
         Self::Io(e.to_string())
     }
 }
+
+impl From<sqlx::Error> for Error {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Database(e.to_string())
+    }
+}
