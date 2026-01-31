@@ -257,11 +257,13 @@ impl FeishuClient {
     /// 用于长链接轮询获取消息
     ///
     /// # 参数说明
+    /// * `container_id_type` - 容器类型（目前仅支持 "chat"）
+    /// * `container_id` - 容器 ID（即 chat_id）
     /// * `page_size` - 每页消息数量
     ///
     /// # 返回值
     /// 消息列表响应
-    pub async fn get_messages(&self, page_size: u32) -> Result<super::handlers::MessageListResponse> {
+    pub async fn get_messages(&self, container_id_type: &str, container_id: &str, page_size: u32) -> Result<super::handlers::MessageListResponse> {
         let token = self.get_access_token().await?;
         let url = format!("{}/im/v1/messages", self.base_url);
 
@@ -269,8 +271,10 @@ impl FeishuClient {
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .query(&[
-                ("page_size", page_size.to_string()),
-                ("sort", "-create_time".to_string()),
+                ("container_id_type", container_id_type),
+                ("container_id", container_id),
+                ("page_size", &page_size.to_string()),
+                ("sort", "-create_time"),
             ])
             .send()
             .await

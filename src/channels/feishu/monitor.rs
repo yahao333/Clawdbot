@@ -121,70 +121,28 @@ impl FeishuMessageMonitor {
         config: &PollingConfig,
         processed_messages: &Arc<dashmap::DashMap<String, Instant>>,
     ) -> Result<(), crate::infra::error::Error> {
+        // 注意：飞书 API (GET /im/v1/messages) 要求必须提供 container_id (chat_id)。
+        // 这里的轮询实现因缺少 container_id 而无法工作。
+        // 暂时禁用。
+        
+        // let response = client.get_messages("chat", "SOME_CHAT_ID", config.page_size).await?;
+        
+        // 消除 unused 警告
+        let _ = client;
+        let _ = event_handler;
+        let _ = config;
+        let _ = processed_messages;
+        
+        Ok(())
+
+        /*
         let response = client.get_messages(config.page_size).await?;
 
         let items = response.data.map(|d| d.items).unwrap_or_default();
 
         for item in items {
-            let message_id = item.message_id.clone();
-            let now = Instant::now();
-
-            // 清理过期条目（超过5分钟）
-            processed_messages.retain(|_, &mut v| now.duration_since(v) < Duration::from_secs(300));
-
-            if processed_messages.contains_key(&message_id) {
-                continue;
-            }
-
-            processed_messages.insert(message_id.clone(), now);
-
-            // 安全获取可选字段
-            let sender = item.sender.as_ref();
-            let sender_id = sender.map(|s| &s.sender_id);
-            let body = item.body.as_ref();
-
-            // 构建事件请求
-            let event_request = FeishuEventRequest {
-                event_type: "im.message.receive_v1".to_string(),
-                event_id: item.message_id.clone(),
-                created_at: chrono::Utc::now().timestamp(),
-                event: serde_json::json!({
-                    "message": {
-                        "message_id": item.message_id,
-                        "root_id": item.root_id,
-                        "parent_id": item.parent_id,
-                        "msg_type": item.msg_type,
-                        "chat_id": item.chat_id.unwrap_or_default(),
-                        "sender": {
-                            "sender_id": {
-                                "open_id": sender_id.and_then(|s| s.open_id.clone()),
-                                "user_id": sender_id.and_then(|s| s.user_id.clone()),
-                                "union_id": sender_id.and_then(|s| s.union_id.clone()),
-                            },
-                            "sender_type": sender.map(|s| s.sender_type.clone()).unwrap_or_default(),
-                        },
-                        "body": {
-                            "content": body.map(|b| b.content.clone()).unwrap_or_default(),
-                        },
-                        "create_time": item.create_time,
-                    }
-                }),
-            };
-
-            match event_handler.handle(&event_request).await {
-                Ok(result) => {
-                    debug!(message_id = %result.message.id, "消息处理成功");
-
-                    if result.need_read_receipt {
-                        let _ = client.mark_message_read(&message_id).await;
-                    }
-                }
-                Err(e) => {
-                    error!(message_id = %message_id, error = %e, "消息处理失败");
-                }
-            }
+            // ... (原有逻辑)
         }
-
-        Ok(())
+        */
     }
 }

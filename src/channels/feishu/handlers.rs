@@ -18,7 +18,7 @@
 //! ```
 
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::core::message::types::{InboundMessage, MessageContent, MessageSource, SenderInfo, TargetInfo};
@@ -374,7 +374,7 @@ pub struct FeishuMessageItem {
 }
 
 /// 飞书发送者
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FeishuSender {
     /// 发送者 ID
     pub sender_id: FeishuSenderId,
@@ -383,7 +383,7 @@ pub struct FeishuSender {
 }
 
 /// 飞书发送者 ID
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FeishuSenderId {
     /// Open ID
     #[serde(default)]
@@ -397,7 +397,7 @@ pub struct FeishuSenderId {
 }
 
 /// 飞书消息体
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FeishuBody {
     /// 消息内容
     #[serde(default)]

@@ -70,6 +70,12 @@ pub enum WsMessage {
         code: i64,
         msg: String,
     },
+    /// 心跳 ping
+    #[serde(rename = "ping")]
+    Ping,
+    /// 心跳响应 pang
+    #[serde(rename = "pang")]
+    Pang,
     /// 未知
     #[serde(other)]
     Unknown,
@@ -157,9 +163,6 @@ impl FeishuWsMonitor {
                         Ok((mut ws, _)) => {
                             info!("WebSocket 连接成功");
 
-                            // 创建内部停止接收器
-                            let mut inner_shutdown = shutdown_tx.subscribe();
-
                             // 启动心跳和读取任务
                             let heartbeat_interval = tokio::time::interval(Duration::from_secs(ws_config.heartbeat_interval_secs));
                             let read_timeout = Duration::from_secs(ws_config.read_timeout_secs);
@@ -168,8 +171,17 @@ impl FeishuWsMonitor {
                             let handler_context = handler_context.clone();
                             let message_handler = message_handler.clone();
                             let client = client.clone();
+                            let shutdown_tx_for_tasks = shutdown_tx.clone();
+                            let processed_messages_for_poll = processed_messages.clone();
+                            let event_handler_for_poll = event_handler.clone();
+                            let handler_context_for_poll = handler_context.clone();
+                            let message_handler_for_poll = message_handler.clone();
+                            let client_for_poll = client.clone();
 
                             let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel(1);
+
+                            // 创建内部停止接收器
+                            let mut inner_shutdown = shutdown_tx_for_tasks.subscribe();
 
                             // 读取任务
                             let read_task = tokio::spawn(async move {
@@ -187,11 +199,46 @@ impl FeishuWsMonitor {
                                 ).await;
                             });
 
+                            // 轮询任务：备用方案，当 WebSocket 没有推送消息时使用
+                            let poll_task = tokio::spawn(async move {
+                                let mut poll_interval = tokio::time::interval(Duration::from_secs(5));
+                                let mut inner_poll_shutdown = shutdown_tx_for_tasks.subscribe();
+
+                                loop {
+                                    tokio::select! {
+                                        _ = poll_interval.tick() => {
+                                            match Self::poll_messages(
+                                                &client_for_poll,
+                                                &processed_messages_for_poll,
+                                                &event_handler_for_poll,
+                                                &handler_context_for_poll,
+                                                message_handler_for_poll.as_ref(),
+                                            ).await {
+                                                Ok(count) => {
+                                                    if count > 0 {
+                                                        info!(count = count, "轮询获取到新消息");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!(error = %e, "轮询消息失败");
+                                                }
+                                            }
+                                        }
+                                        _ = inner_poll_shutdown.recv() => {
+                                            info!("轮询任务收到停止信号");
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+
                             // 等待退出信号
                             let _ = exit_rx.recv().await;
 
                             // 停止读取任务
                             read_task.abort();
+                            // 停止轮询任务
+                            poll_task.abort();
                         }
                         Err(e) => {
                             error!(error = %e, "WebSocket 连接失败");
@@ -263,6 +310,8 @@ impl FeishuWsMonitor {
                                     ws,
                                     processed_messages,
                                     event_handler,
+                                    &*handler_context,
+                                    &*message_handler,
                                     client,
                                 ).await {
                                     error!(error = %e, "处理消息失败");
@@ -307,29 +356,54 @@ impl FeishuWsMonitor {
         >,
         processed_messages: &Arc<dashmap::DashMap<String, Instant>>,
         event_handler: &MessageEventHandler,
+        handler_context: &HandlerContext,
+        message_handler: &dyn MessageHandler,
         client: &FeishuClient,
     ) -> Result<(), crate::infra::error::Error> {
         use futures::SinkExt; // Import SinkExt for send()
 
-        debug!(message = %text, "收到 WebSocket 消息");
+        // 详细调试日志：显示原始消息
+        info!(raw_message = %text, "收到 WebSocket 消息");
 
         // 解析消息
-        let msg: WsMessage = serde_json::from_str(text)
-            .map_err(|e| crate::infra::error::Error::Serialization(e.to_string()))?;
+        let msg: WsMessage = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(error = %e, raw = %text, "解析 WebSocket 消息失败");
+                return Err(crate::infra::error::Error::Serialization(e.to_string()));
+            }
+        };
+
+        // 打印解析后的消息类型
+        info!(msg_type = ?msg, "消息解析完成");
 
         match msg {
             WsMessage::Receive { id, content } => {
+                info!(msg_id = %id, "收到 receive 类型消息");
+                info!(content = %content, "消息内容");
+
                 // 检查是否是消息事件
                 if let Some(event_type) = content.get("type") {
+                    info!(event_type = %event_type, "事件类型");
+
+                    // 打印完整的 content 结构
+                    info!(full_content = %serde_json::to_string_pretty(&content).unwrap_or_default(), "完整事件数据");
+
                     if event_type == "im.message.receive_v1" {
                         Self::handle_message_event(
                             &id,
                             content,
                             processed_messages,
                             event_handler,
+                            handler_context,
+                            message_handler,
                             client,
                         ).await;
+                    } else {
+                        info!(event_type = %event_type, "跳过非消息事件");
                     }
+                } else {
+                    warn!(content = %content, "消息中没有 type 字段");
                 }
 
                 // 发送确认
@@ -349,10 +423,64 @@ impl FeishuWsMonitor {
             WsMessage::Error { id, code, msg } => {
                 error!(id = %id, code = code, msg = %msg, "WebSocket 错误");
             }
-            _ => {}
+            WsMessage::Ping => {
+                info!("收到心跳 ping");
+                // 响应 pang
+                let pong = serde_json::json!({"type": "pang"});
+                let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(pong.to_string())).await;
+            }
+            WsMessage::Send { id, content } => {
+                info!(msg_id = %id, content = %content, "收到 Send 消息");
+            }
+            WsMessage::Pang => {
+                info!("收到心跳响应 pang");
+            }
+            WsMessage::Unknown => {
+                warn!("收到未知类型的 WebSocket 消息");
+            }
         }
 
         Ok(())
+    }
+
+    /// 轮询获取消息（备用方案）
+    async fn poll_messages(
+        client: &FeishuClient,
+        processed_messages: &Arc<dashmap::DashMap<String, Instant>>,
+        event_handler: &MessageEventHandler,
+        handler_context: &HandlerContext,
+        message_handler: &dyn MessageHandler,
+    ) -> Result<u32, crate::infra::error::Error> {
+        // 注意：飞书 API (GET /im/v1/messages) 要求必须提供 container_id (chat_id)。
+        // 由于我们无法获取全局所有会话的 ID，且 WebSocket 是主要的接收方式，
+        // 这里暂时禁用轮询功能，避免 API 报错 "field validation failed"。
+        // 如果需要启用轮询，必须针对特定的 chat_id 进行。
+        
+        // let response = client.get_messages("chat", "SOME_CHAT_ID", 20).await?;
+        
+        // 为避免 unused 警告，使用下划线
+        let _ = client;
+        let _ = processed_messages;
+        let _ = event_handler;
+        let _ = handler_context;
+        let _ = message_handler;
+
+        Ok(0)
+
+        /* 
+        // 原始代码保留供参考（但在缺少 chat_id 时无法工作）
+        use super::handlers::FeishuMessageItem;
+
+        let response = client.get_messages(20).await?;
+
+        let mut new_count = 0;
+        if let Some(data) = response.data {
+            for item in data.items {
+                // ... (原有逻辑)
+            }
+        }
+        Ok(new_count)
+        */
     }
 
     /// 处理消息事件
@@ -361,6 +489,8 @@ impl FeishuWsMonitor {
         event_data: serde_json::Value,
         processed_messages: &Arc<dashmap::DashMap<String, Instant>>,
         event_handler: &MessageEventHandler,
+        handler_context: &HandlerContext,
+        message_handler: &dyn MessageHandler,
         client: &FeishuClient,
     ) {
         let now = Instant::now();
@@ -369,6 +499,7 @@ impl FeishuWsMonitor {
         processed_messages.retain(|_, &mut v| now.duration_since(v) < Duration::from_secs(300));
 
         if processed_messages.contains_key(event_id) {
+            debug!(event_id = %event_id, "消息已处理过，跳过");
             return;
         }
 
@@ -384,10 +515,35 @@ impl FeishuWsMonitor {
 
         match event_handler.handle(&event_request).await {
             Ok(result) => {
-                debug!(message_id = %result.message.id, "消息处理成功");
+                // 先保存消息 ID，后面还会用到
+                let message_id = result.message.id.clone();
+                let chat_id = result.message.target.id.clone();
+
+                info!(
+                    message_id = %message_id,
+                    chat_id = %chat_id,
+                    sender_id = %result.message.sender.id,
+                    "收到飞书消息，准备处理"
+                );
+
+                // 调用消息处理器处理消息
+                match message_handler.handle(handler_context, result.message).await {
+                    Ok(_) => {
+                        info!(message_id = %message_id, "消息处理完成");
+                    }
+                    Err(e) => {
+                        error!(message_id = %message_id, error = %e, "消息处理器执行失败");
+                    }
+                }
+
+                // 如果需要已读回执，发送已读标记
+                if result.need_read_receipt {
+                    // TODO: 发送已读回执
+                    debug!(message_id = %message_id, "需要发送已读回执");
+                }
             }
             Err(e) => {
-                error!(event_id = %event_id, error = %e, "消息处理失败");
+                error!(event_id = %event_id, error = %e, "消息事件处理失败");
             }
         }
     }
