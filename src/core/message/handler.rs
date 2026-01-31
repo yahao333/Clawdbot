@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
-use super::{types::InboundMessage, types::OutboundMessage, queue::MessageQueue, sender::MessageSender};
+use super::{types::InboundMessage, types::OutboundMessage, queue::{MessageQueue, QueueError}, sender::MessageSender};
 use crate::core::routing::Router;
 use crate::core::agent::AiEngine;
 use crate::core::session::SessionManager;
@@ -203,14 +203,22 @@ impl MessageHandler for DefaultMessageHandler {
 
         // 3. 消息队列处理（去重和防抖）
         debug!("消息入队处理");
-        let _ = ctx.queue.push(message.clone())
-            .await
-            .map_err(|e| crate::infra::error::Error::Channel(e.to_string()))?;
+        match ctx.queue.push(message.clone()).await {
+            Ok(_) => {
+                info!(message_id = %message_id, "消息已入队待处理");
+            }
+            Err(QueueError::Duplicate { message_id }) => {
+                warn!(message_id = %message_id, "消息重复，跳过处理");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(crate::infra::error::Error::Channel(e.to_string()));
+            }
+        }
 
         // 7. 调用处理后钩子（表示已成功入队）
         self.after_handle(&message, &Ok(())).await;
 
-        info!(message_id = %message_id, "消息已入队待处理");
         Ok(())
     }
 }

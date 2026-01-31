@@ -149,9 +149,9 @@ impl SessionManager {
         Some(session)
     }
 
-    /// 消息去重检查
+    /// 消息去重检查（原子操作版本）
     ///
-    /// 使用 message_id 检查消息是否已处理
+    /// 使用原子插入来避免竞态条件，确保只有一个任务能处理指定消息
     ///
     /// # 参数说明
     /// * `message_id` - 消息ID
@@ -169,19 +169,21 @@ impl SessionManager {
         // 清理过期条目（5分钟）
         self.message_dedupe.retain(|_, (_, time)| now - *time < 300000);
 
-        // 检查是否已处理
-        if let Some(entry) = self.message_dedupe.get(message_id) {
-            let (sess_id, _) = entry.value();
-            // 如果在同一个会话中已处理，跳过
-            if sess_id.as_str() == session_id {
-                debug!(message_id = %message_id, "消息已处理过，跳过");
-                return true;
-            }
-        }
+        // 原子插入：如果 key 已存在，insert 返回 Some，表示消息已处理
+        // 如果 key 不存在，insert 返回 None，表示可以继续处理
+        let entry = self.message_dedupe.insert(
+            message_id.to_string(),
+            (session_id.to_string(), now)
+        );
 
-        // 标记为已处理
-        self.message_dedupe.insert(message_id.to_string(), (session_id.to_string(), now));
-        false
+        if entry.is_some() {
+            // 消息已存在，说明之前已处理过
+            debug!(message_id = %message_id, "消息已处理过，跳过");
+            true
+        } else {
+            // 新插入，说明是第一次处理
+            false
+        }
     }
 
     /// 检查消息是否重复（基于会话+内容）

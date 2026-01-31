@@ -288,7 +288,7 @@ impl MessageQueue {
         false
     }
 
-    /// 将消息推入队列
+    /// 将消息推入队列（带原子去重）
     ///
     /// # 参数说明
     /// * `message` - 要推送的消息
@@ -299,6 +299,7 @@ impl MessageQueue {
     /// # 错误
     /// - `QueueFullError`: 队列已满且丢弃策略为 DropNew
     /// - `ChannelClosedError`: 通道已关闭
+    /// - `QueueError::Duplicate`: 消息重复（去重窗口内已存在）
     ///
     /// # 日志记录
     /// - INFO: 消息入队
@@ -307,7 +308,31 @@ impl MessageQueue {
         &self,
         message: super::types::InboundMessage,
     ) -> Result<super::types::InboundMessage, QueueError> {
-        // 根据丢弃策略处理
+        let debounce_ms = self.get_debounce_ms(&message.channel);
+        let key = self.build_dedupe_key(&message, debounce_ms);
+
+        // 原子插入进行去重：如果 key 已存在，insert 返回 Some
+        let existing_entry = self.active_messages.insert(key, std::time::Instant::now());
+
+        // 如果消息已存在（不是第一次插入），检查是否在去重窗口内
+        if let Some(instant) = existing_entry {
+            let elapsed = instant.elapsed();
+            if elapsed < Duration::from_millis(debounce_ms) {
+                // 在去重窗口内，消息重复，不入队
+                warn!(
+                    message_id = %message.id,
+                    channel = %message.channel,
+                    elapsed_ms = elapsed.as_millis(),
+                    "消息重复，跳过入队"
+                );
+                return Err(QueueError::Duplicate {
+                    message_id: message.id.clone(),
+                });
+            }
+            // 如果已过期，则允许新消息入队（旧的已失效）
+        }
+
+        // 根据丢弃策略处理发送
         match self.config.drop_policy {
             // 策略1：丢弃新消息 - 尝试发送，失败则返回错误
             QueueDropPolicy::DropNew => {
@@ -342,11 +367,6 @@ impl MessageQueue {
                 }
             }
         }
-
-        // 添加到活跃消息追踪
-        let debounce_ms = self.get_debounce_ms(&message.channel);
-        let key = self.build_dedupe_key(&message, debounce_ms);
-        self.active_messages.insert(key, std::time::Instant::now());
 
         debug!(message_id = %message.id, "消息已入队");
 
@@ -438,5 +458,12 @@ pub enum QueueError {
         message_id: String,
         /// 错误原因
         msg: String,
+    },
+
+    /// 消息重复错误（去重窗口内已存在相同消息）
+    #[error("消息重复: {message_id}")]
+    Duplicate {
+        /// 消息 ID
+        message_id: String,
     },
 }
