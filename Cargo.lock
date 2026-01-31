@@ -374,6 +374,7 @@ dependencies = [
  "dotenv",
  "fake",
  "futures",
+ "hex",
  "hmac",
  "humantime",
  "hyper 1.8.1",

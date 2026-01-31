@@ -18,15 +18,23 @@
 //! verification_token = "${FEISHU_VERIFICATION_TOKEN}"
 //! ```
 
-pub mod client;      // HTTP 客户端
-pub mod handlers;    // 事件处理
-pub mod send;        // 消息发送
-pub mod monitor;     // 消息监控（轮询）
-pub mod ws;          // WebSocket 长链接
+pub mod client;          // HTTP 客户端
+pub mod handlers;        // 事件处理
+pub mod send;            // 消息发送
+pub mod monitor;         // 消息监控（轮询）
+pub mod ws;              // WebSocket 长链接
+pub mod dispatcher;      // 事件分发器
+pub mod contact;         // 用户联系人（名称缓存）
+pub mod media;           // 媒体文件下载
+pub mod group;           // 群组策略
 
 // 重新导出常用类型
 pub use client::{FeishuClient, FeishuCredentials};
 pub use handlers::{MessageEventHandler, FeishuEventRequest, MessageReceiveResult};
-pub use send::{FeishuMessageSender, MessageReceiver, SendMessageResponse};
+pub use send::{FeishuMessageSender, MessageReceiver, SendMessageResponse, CardButton};
 pub use monitor::FeishuMessageMonitor;
 pub use ws::FeishuWsMonitor;
+pub use dispatcher::{EventDispatcher, create_feishu_event_dispatcher};
+pub use contact::{ContactClient, FeishuUserInfo};
+pub use media::MediaDownloader;
+pub use group::{GroupStrategyManager, GroupPolicy, ChatPolicy, StrategyStats, StrategyDecision};

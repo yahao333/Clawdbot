@@ -90,6 +90,94 @@ pub struct FeishuImageContent {
     pub height: Option<u32>,
 }
 
+/// 飞书富文本（post）消息内容
+///
+/// 富文本消息结构：
+/// ```json
+/// {
+///   "title": "标题",
+///   "content": [
+///     [{"tag": "text", "text": "第一段"}, {"tag": "at", "user_id": "xxx"}],
+///     [{"tag": "img", "image_key": "xxx"}]
+///   ]
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct FeishuPostContent {
+    /// 标题
+    pub title: Option<String>,
+    /// 内容（多段落）
+    #[serde(default)]
+    pub content: Vec<Vec<FeishuPostElement>>,
+}
+
+/// 富文本元素
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "tag")]
+pub enum FeishuPostElement {
+    /// 文本元素
+    #[serde(rename = "text")]
+    Text {
+        /// 文本内容
+        text: Option<String>,
+        /// 是否加粗
+        #[serde(default)]
+        bold: Option<bool>,
+        /// 是否斜体
+        #[serde(default)]
+        italic: Option<bool>,
+        /// 是否删除线
+        #[serde(default, rename = "strikethrough")]
+        strike_through: Option<bool>,
+        /// 链接
+        #[serde(default)]
+        href: Option<String>,
+    },
+    /// @提及元素
+    #[serde(rename = "at")]
+    At {
+        /// 用户 ID
+        #[serde(default)]
+        user_id: Option<String>,
+        /// 用户名
+        #[serde(default, rename = "user_name")]
+        user_name: Option<String>,
+    },
+    /// 图片元素
+    #[serde(rename = "img")]
+    Image {
+        /// 图片密钥
+        #[serde(default, rename = "image_key")]
+        image_key: Option<String>,
+    },
+    /// 链接元素
+    #[serde(rename = "a")]
+    Link {
+        /// 链接地址
+        #[serde(default)]
+        href: Option<String>,
+        /// 显示文本
+        #[serde(default)]
+        text: Option<String>,
+    },
+}
+
+/// 飞书 @提及信息
+///
+/// 消息事件中的 mentions 字段
+#[derive(Debug, Deserialize, Clone)]
+pub struct FeishuMention {
+    /// 提及键
+    pub key: String,
+    /// 用户 ID 信息
+    pub id: FeishuSenderId,
+    /// 用户名
+    pub name: String,
+    /// 租户密钥
+    #[serde(default)]
+    pub tenant_key: Option<String>,
+}
+
 /// 消息接收处理结果
 pub struct MessageReceiveResult {
     /// 转换后的消息
@@ -193,7 +281,7 @@ impl MessageEventHandler {
             source,
             sender: SenderInfo {
                 id: sender_id,
-                username: None, // 需要额外 API 调用获取
+                username: None,
                 display_name: None,
                 avatar_url: None,
             },
@@ -259,12 +347,119 @@ impl MessageEventHandler {
                     quoted_message: None,
                 }, msg_type))
             }
+            "post" => {
+                // 富文本消息（post）
+                self.parse_post_content(&message.content)
+            }
             _ => {
                 // 其他类型消息
                 warn!(msg_type = %msg_type, "收到未知消息类型");
                 Ok((MessageContent::text(&format!("[未知消息类型: {}]", msg_type)), msg_type))
             }
         }
+    }
+
+    /// 解析富文本消息内容
+    ///
+    /// 解析 post 类型消息，提取纯文本和图片
+    fn parse_post_content(&self, content: &str) -> Result<(MessageContent, String)> {
+        let post_content: FeishuPostContent = serde_json::from_str(content)
+            .map_err(|e| Error::Serialization(e.to_string()))?;
+
+        // 解析富文本内容，提取纯文本和图片
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut image_keys: Vec<String> = Vec::new();
+
+        // 添加标题
+        if let Some(title) = &post_content.title {
+            text_parts.push(format!("【{}】", title));
+        }
+
+        // 解析每个段落
+        for paragraph in &post_content.content {
+            let mut para_text = String::new();
+
+            for element in paragraph {
+                match element {
+                    FeishuPostElement::Text { text, bold, italic, href, .. } => {
+                        let mut elem_text = text.as_deref().unwrap_or("").to_string();
+
+                        // 处理链接
+                        if let Some(link) = href {
+                            elem_text = format!("[{}]({})", elem_text, link);
+                        }
+
+                        // 处理样式
+                        if bold.as_ref() == Some(&true) {
+                            elem_text = format!("**{}**", elem_text);
+                        }
+                        if italic.as_ref() == Some(&true) {
+                            elem_text = format!("_{}_", elem_text);
+                        }
+
+                        para_text.push_str(&elem_text);
+                    }
+                    FeishuPostElement::At { user_id, user_name } => {
+                        // @提及用户
+                        let mention_text = match (user_id, user_name) {
+                            (Some(_id), Some(name)) => format!("@{}", name),
+                            (Some(id), None) => format!("@{}", id),
+                            (None, Some(name)) => format!("@{}", name),
+                            (None, None) => String::from("@未知用户"),
+                        };
+                        para_text.push_str(&mention_text);
+                    }
+                    FeishuPostElement::Image { image_key } => {
+                        // 记录图片 key，后续需要下载
+                        if let Some(key) = image_key {
+                            image_keys.push(key.clone());
+                        }
+                        para_text.push_str("[图片]");
+                    }
+                    FeishuPostElement::Link { href, text } => {
+                        let display_text = text.as_deref().unwrap_or("链接");
+                        let link = href.as_deref().unwrap_or("");
+                        para_text.push_str(&format!("[{}]({})", display_text, link));
+                    }
+                }
+            }
+
+            if !para_text.is_empty() {
+                text_parts.push(para_text);
+            }
+        }
+
+        let full_text = text_parts.join("\n");
+
+        // 构建附件列表（图片）
+        let attachments: Vec<_> = image_keys
+            .into_iter()
+            .map(|image_key| crate::core::message::types::Attachment {
+                kind: crate::core::message::types::AttachmentKind::Image(
+                    crate::core::message::types::ImageAttachment {
+                        width: None,
+                        height: None,
+                        format: "unknown".to_string(),
+                        is_animated: false,
+                    },
+                ),
+                filename: None,
+                mime_type: "image".to_string(),
+                size: 0,
+                url: Some(image_key),
+                local_path: None,
+            })
+            .collect();
+
+        Ok((MessageContent {
+            text: Some(full_text),
+            rich_text: Some(crate::core::message::types::RichText {
+                format: "feishu_post".to_string(),
+                content: content.to_string(),
+            }),
+            attachments,
+            quoted_message: None,
+        }, "post".to_string()))
     }
 }
 
@@ -281,18 +476,52 @@ impl SignatureVerifier {
     /// * `sign` - 签名
     /// * `body` - 请求体
     /// * `secret` - 加密密钥
-    ///
-    /// # 返回值
-    /// 验证成功返回 `Ok(())`
     pub fn verify(timestamp: &str, sign: &str, body: &str, secret: &str) -> Result<()> {
-        // TODO: 实现签名验证
-        // 1. 拼接 timestamp + body
-        // 2. 使用 HMAC-SHA256 计算签名
-        // 3. 与请求头中的 sign 对比
+        // 1. 验证时间戳格式
+        let timestamp = timestamp.parse::<i64>()
+            .map_err(|_| Error::Channel("无效的时间戳格式".to_string()))?;
 
-        tracing::warn!("飞书签名验证尚未实现，跳过验证");
+        // 2. 验证时间戳是否在有效期内（5 分钟内）
+        let now = Utc::now().timestamp();
+        let time_diff = (now - timestamp).abs();
+        if time_diff > 300 {
+            tracing::warn!(timestamp = timestamp, now = now, time_diff = time_diff, "时间戳已过期");
+            return Err(Error::Channel("时间戳已过期".to_string()));
+        }
 
-        Ok(())
+        // 3. 拼接 timestamp + body
+        let message = format!("{}{}", timestamp, body);
+
+        // 4. 使用 HMAC-SHA256 计算签名
+        let expected_sign = Self::hmac_sha256(&message, secret);
+
+        // 5. 与请求头中的 sign 对比
+        if expected_sign == sign {
+            tracing::debug!("签名验证成功");
+            Ok(())
+        } else {
+            tracing::warn!(expected = %expected_sign, received = %sign, "签名验证失败");
+            Err(Error::Channel("签名验证失败".to_string()))
+        }
+    }
+
+    /// HMAC-SHA256 签名计算
+    fn hmac_sha256(message: &str, key: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        type HmacSha256 = Hmac<Sha256>;
+
+        // 创建 HMAC-SHA256 实例
+        let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+            .expect("HMAC-SHA256 密钥长度无效");
+
+        // 对消息进行签名
+        mac.update(message.as_bytes());
+        let result = mac.finalize();
+
+        // 将签名转换为十六进制字符串
+        hex::encode(result.into_bytes())
     }
 }
 

@@ -188,6 +188,11 @@ impl FeishuClient {
         }
     }
 
+    /// 获取 HTTP 客户端（仅供内部模块使用）
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     /// 发送 API 请求
     ///
     /// 通用方法，用于发送经过认证的 API 请求
@@ -296,6 +301,113 @@ impl FeishuClient {
         }
 
         Ok(response)
+    }
+
+    /// 获取单条消息详情
+    ///
+    /// 根据消息 ID 获取消息的完整详情
+    ///
+    /// # 参数说明
+    /// * `message_id` - 消息 ID
+    ///
+    /// # 返回值
+    /// 消息详情
+    pub async fn get_message(&self, message_id: &str) -> Result<super::handlers::FeishuMessageItem> {
+        let token = self.get_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}", self.base_url, message_id);
+
+        let response = self.http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("获取消息详情失败: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(Error::Channel(format!("获取消息详情失败: {}", error_text)));
+        }
+
+        let response_text = response.text().await
+            .map_err(|e| Error::Network(format!("解析消息详情响应失败: {}", e)))?;
+
+        #[derive(Deserialize)]
+        struct MessageResponse {
+            code: i64,
+            msg: String,
+            data: Option<MessageData>,
+        }
+
+        #[derive(Deserialize)]
+        struct MessageData {
+            #[serde(rename = "items")]
+            items: Option<Vec<super::handlers::FeishuMessageItem>>,
+        }
+
+        let response: MessageResponse = serde_json::from_str(&response_text)
+            .map_err(|e| Error::Serialization(format!("解析消息详情失败: {}", e)))?;
+
+        if response.code != 0 {
+            return Err(Error::Channel(format!("飞书 API 错误: {}", response.msg)));
+        }
+
+        response.data
+            .and_then(|d| d.items.and_then(|mut items| items.pop()))
+            .ok_or_else(|| Error::Channel("响应中未包含消息详情".to_string()))
+    }
+
+    /// 获取消息内容
+    ///
+    /// 获取指定消息的完整内容（包括 text, post 等）
+    ///
+    /// # 参数说明
+    /// * `message_id` - 消息 ID
+    /// * `message_type` - 消息类型（text, post, image 等）
+    ///
+    /// # 返回值
+    /// 消息内容字符串
+    pub async fn get_message_content(&self, message_id: &str, message_type: &str) -> Result<String> {
+        let token = self.get_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}/content", self.base_url, message_id);
+
+        let response = self.http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("获取消息内容失败: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(Error::Channel(format!("获取消息内容失败: {}", error_text)));
+        }
+
+        let response_text = response.text().await
+            .map_err(|e| Error::Network(format!("解析消息内容响应失败: {}", e)))?;
+
+        #[derive(Deserialize)]
+        struct ContentResponse {
+            code: i64,
+            msg: String,
+            data: Option<ContentData>,
+        }
+
+        #[derive(Deserialize)]
+        struct ContentData {
+            #[serde(rename = "content")]
+            content: String,
+        }
+
+        let response: ContentResponse = serde_json::from_str(&response_text)
+            .map_err(|e| Error::Serialization(format!("解析消息内容失败: {}", e)))?;
+
+        if response.code != 0 {
+            return Err(Error::Channel(format!("飞书 API 错误: {}", response.msg)));
+        }
+
+        response.data
+            .map(|d| d.content)
+            .ok_or_else(|| Error::Channel("响应中未包含消息内容".to_string()))
     }
 
     /// 发送已读回执

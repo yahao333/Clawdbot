@@ -102,6 +102,8 @@ base64 = "0.22"
 hmac = "0.12"
 # sha2：SHA256 哈希（用于飞书签名验证）
 sha2 = "0.10"
+# hex：十六进制编码（用于飞书签名验证）
+hex = "0.4"
 # native-tls：TLS 加密（用于 SMTP 邮件告警）
 native-tls = "0.2"
 # humantime：人类可读的时间格式
