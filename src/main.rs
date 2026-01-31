@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 use clap::{Parser, Subcommand};
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use clawdbot::service::{ClawdbotService, ServiceConfig};
 use clawdbot::web::ServiceStatus;
+use clawdbot::infra::config::ConfigLoader;
+use clawdbot::security::AuditService;
 
 // 命令行参数解析结构体
 #[derive(Parser, Debug)]
@@ -92,20 +94,50 @@ async fn main() {
 async fn run_service(config_path: &str, port: u16, web_port: u16) {
     info!(path = config_path, port = port, web_port = web_port, "开始启动机器人");
 
+    // 1. 先加载配置（需要用于初始化 AuditService）
+    let loader = ConfigLoader::new();
+    let config = match loader.load(config_path).await {
+        Ok(cfg) => {
+            info!("配置加载成功");
+            cfg
+        }
+        Err(e) => {
+            error!(error = %e, "配置加载失败");
+            return;
+        }
+    };
+
+    // 2. 如果启用了安全审计，创建 AuditService
+    let audit_service = if config.security.enabled {
+        match AuditService::new(Arc::new(config.clone())).await {
+            Ok(service) => {
+                info!("审计服务已启用");
+                Some(service)
+            }
+            Err(e) => {
+                warn!(error = %e, "审计服务初始化失败，将继续运行但不记录审计日志");
+                None
+            }
+        }
+    } else {
+        info!("安全审计已禁用");
+        None
+    };
+
     let service_config = ServiceConfig {
         config_path: config_path.to_string(),
         port,
         ..Default::default()
     };
 
-    // 创建 Web 服务器（如果需要）
+    // 3. 创建 Web 服务器（如果需要）
     let web_server = if web_port > 0 {
         Some(clawdbot::web::WebServer::new(web_port))
     } else {
         None
     };
 
-    // 获取 Web 状态（用于仪表盘数据更新）
+    // 4. 获取 Web 状态（用于仪表盘数据更新）
     let web_state: Arc<clawdbot::web::WebState> = if let Some(ref ws) = web_server {
         ws.state().clone()
     } else {
@@ -119,7 +151,15 @@ async fn run_service(config_path: &str, port: u16, web_port: u16) {
         return;
     }
 
-    // 启动 Web 服务器（如果指定了端口）
+    // 5. 设置审计服务到 WebServer（需要在服务初始化之后）
+    if let Some(ref ws) = web_server {
+        if let Some(audit_svc) = audit_service {
+            ws.set_audit_service(audit_svc);
+            info!("审计服务已绑定到 Web 管理界面");
+        }
+    }
+
+    // 6. 启动 Web 服务器（如果指定了端口）
     if web_port > 0 {
         // 使用之前创建的 web_server，而不是创建新的实例
         let web_server = web_server.unwrap();  // 获取之前创建的 WebServer
