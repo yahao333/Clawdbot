@@ -703,7 +703,11 @@ impl FeishuWsMonitor {
         use dashmap::mapref::entry::Entry;
         match processed_messages.entry(dedupe_key.clone()) {
             Entry::Occupied(_) => {
-                warn!(message_id = %dedupe_key, "检测到重复消息（并发竞争），跳过");
+                warn!(
+                    message_id = %dedupe_key,
+                    event_id = %event_id,
+                    "检测到重复消息（并发竞争），跳过"
+                );
                 return;
             },
             Entry::Vacant(entry) => {
