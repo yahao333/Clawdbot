@@ -1954,28 +1954,33 @@ const HTML_INDEX: &str = r#"
         }
         .dashboard-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
+            grid-template-columns: repeat(4, 1fr);
             grid-template-rows: auto 1fr;
             gap: 20px;
         }
-        /* 渠道状态 - 第一行第一列 */
-        .dashboard-section.channels {
+        /* 模型状态 - 第一行第一列 */
+        .dashboard-section.models {
             grid-column: 1 / 2;
             grid-row: 1 / 2;
         }
-        /* 性能指标 - 第一行第二列 */
-        .dashboard-section.performance {
+        /* 渠道状态 - 第一行第二列 */
+        .dashboard-section.channels {
             grid-column: 2 / 3;
             grid-row: 1 / 2;
         }
-        /* 快捷操作 - 第一行第三列 */
-        .dashboard-section.quick-actions {
+        /* 性能指标 - 第一行第三列 */
+        .dashboard-section.performance {
             grid-column: 3 / 4;
+            grid-row: 1 / 2;
+        }
+        /* 快捷操作 - 第一行第四列 */
+        .dashboard-section.quick-actions {
+            grid-column: 4 / 5;
             grid-row: 1 / 2;
         }
         /* 最近消息 - 第二行独占整行 */
         .dashboard-section.messages {
-            grid-column: 1 / 4;
+            grid-column: 1 / 5;
             grid-row: 2 / 3;
         }
         .dashboard-section {
@@ -1991,6 +1996,33 @@ const HTML_INDEX: &str = r#"
             display: flex;
             align-items: center;
             gap: 8px;
+        }
+        .model-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .model-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        .model-name {
+            font-weight: 500;
+            color: #333;
+        }
+        .model-status {
+            font-size: 0.8rem;
+            color: #28a745;
+            background: #d4edda;
+            padding: 2px 8px;
+            border-radius: 10px;
         }
         .channel-list {
             display: flex;
@@ -2134,6 +2166,7 @@ const HTML_INDEX: &str = r#"
                 grid-template-columns: 1fr;
                 grid-template-rows: auto auto 1fr auto;
             }
+            .dashboard-section.models,
             .dashboard-section.channels,
             .dashboard-section.performance,
             .dashboard-section.quick-actions {
@@ -2200,6 +2233,14 @@ const HTML_INDEX: &str = r#"
 
         <!-- 主体网格 -->
         <div class="dashboard-grid">
+            <!-- 模型状态 -->
+            <div class="dashboard-section models">
+                <h2>🤖 模型</h2>
+                <div class="model-list" id="modelList">
+                    <div class="empty-message">加载中...</div>
+                </div>
+            </div>
+
             <!-- 渠道状态 - 紧凑显示 -->
             <div class="dashboard-section channels">
                 <h2>📡 渠道</h2>
@@ -2282,6 +2323,25 @@ const HTML_INDEX: &str = r#"
                 document.getElementById('aiRequests').textContent = formatNumber(
                     (data.ai_success_rate !== undefined && data.ai_success_rate > 0) ?
                     Math.round(data.today_messages / (data.ai_success_rate / 100)) : 0);
+
+                // 更新模型状态
+                try {
+                    const modelRes = await fetch('/api/config/providers');
+                    const modelData = await modelRes.json();
+                    const modelList = document.getElementById('modelList');
+                    if (modelData.providers && modelData.providers.length > 0) {
+                        modelList.innerHTML = modelData.providers.map(p => `
+                            <div class="model-item">
+                                <span class="model-name">${p}</span>
+                                <span class="model-status">${p === modelData.default ? '默认' : '可用'}</span>
+                            </div>
+                        `).join('');
+                    } else {
+                        modelList.innerHTML = '<div class="empty-message">暂无模型配置</div>';
+                    }
+                } catch (e) {
+                    console.error('加载模型数据失败:', e);
+                }
 
                 // 更新渠道状态
                 const channelList = document.getElementById('channelList');
