@@ -208,6 +208,21 @@ impl FeishuWsMonitor {
                         Ok((mut ws, _)) => {
                             info!("WebSocket 连接成功");
 
+                            // 更新飞书渠道状态为已连接
+                            if let Some(web_state) = handler_context.web_state() {
+                                let status = crate::web::ChannelConnectionStatus {
+                                    connected: true,
+                                    last_connected: Some(chrono::Utc::now().to_rfc3339()),
+                                    last_error: None,
+                                    message_count: 0,
+                                };
+                                tracing::info!("飞书连接成功，正在更新渠道状态...");
+                                web_state.update_channel_status("feishu", status).await;
+                                tracing::info!("飞书渠道状态已更新");
+                            } else {
+                                tracing::warn!("无法更新飞书渠道状态：web_state 为 None");
+                            }
+
                             // 启动心跳和读取任务
                             let heartbeat_interval = tokio::time::interval(Duration::from_secs(ws_config.heartbeat_interval_secs));
                             let read_timeout = Duration::from_secs(ws_config.read_timeout_secs);

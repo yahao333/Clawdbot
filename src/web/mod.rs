@@ -173,6 +173,8 @@ impl WebSocketManager {
 /// Web 服务器状态
 #[derive(Clone)]
 pub struct WebState {
+    /// 唯一标识符（用于调试）
+    pub id: String,
     /// 消息统计
     pub message_stats: Arc<RwLock<MessageStats>>,
     /// 对话历史（内存中）
@@ -192,6 +194,43 @@ pub struct WebState {
     pub auth_config: Arc<RwLock<AuthConfig>>,
     /// WebSocket 管理器
     pub ws_manager: Arc<WebSocketManager>,
+}
+
+impl WebState {
+    /// 创建新的 WebState（不启动 Web 服务器时使用）
+    pub fn new() -> Self {
+        let id = format!("{:x}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis());
+        tracing::info!(id = %id, "创建新的 WebState");
+        Self {
+            id,
+            message_stats: Arc::new(RwLock::new(MessageStats::default())),
+            conversation_history: Arc::new(RwLock::new(Vec::new())),
+            config: Arc::new(tokio::sync::Mutex::new(None)),
+            audit_service: Arc::new(RwLock::new(None)),
+            service_status: Arc::new(RwLock::new(ServiceStatus::Running)),
+            ai_engine_status: Arc::new(RwLock::new(AIEngineStatus::default())),
+            channel_status: Arc::new(RwLock::new(HashMap::new())),
+            auth_config: Arc::new(RwLock::new(AuthConfig::default())),
+            ws_manager: Arc::new(WebSocketManager::new()),
+        }
+    }
+
+    /// 更新渠道连接状态
+    pub async fn update_channel_status(&self, channel: &str, status: ChannelConnectionStatus) {
+        tracing::info!(id = %self.id, channel = channel, connected = status.connected, "开始更新渠道状态");
+        let mut channel_status = self.channel_status.write().await;
+        channel_status.insert(channel.to_string(), status.clone());
+        tracing::info!(id = %self.id, channel_status_count = channel_status.len(), "渠道状态已更新");
+        // 广播状态更新
+        self.ws_manager.broadcast(WebSocketMessage::ChannelStatus {
+            channel: channel.to_string(),
+            connected: status.connected,
+            message: status.last_error.or(status.last_connected),
+        });
+    }
 }
 
 // ==================== 类型定义 ====================
@@ -1254,6 +1293,11 @@ async fn api_dashboard_stats(State(state): State<WebState>) -> Json<DashboardSta
     let channel_status = state.channel_status.read().await;
     let history = state.conversation_history.read().await;
 
+    tracing::info!(id = %state.id, channel_status_len = channel_status.len(), "API 读取渠道状态");
+    for (name, status) in &*channel_status {
+        tracing::info!(id = %state.id, channel = name, connected = status.connected, "API 读取到渠道状态");
+    }
+
     // 计算 AI 成功率
     let ai_success_rate = if message_stats.ai_requests_total > 0 {
         (message_stats.ai_requests_success as f64 / message_stats.ai_requests_total as f64) * 100.0
@@ -1281,6 +1325,7 @@ async fn api_dashboard_stats(State(state): State<WebState>) -> Json<DashboardSta
 
     // 如果没有渠道状态，添加默认飞书
     if channels.is_empty() {
+        tracing::warn!("API 未读取到任何渠道状态，添加默认飞书（未连接）");
         channels.push(ChannelInfo {
             name: "feishu".to_string(),
             display_name: "飞书".to_string(),
@@ -1555,8 +1600,8 @@ async fn api_audit_cleanup(State(state): State<WebState>) -> Json<JsonValue> {
 pub struct WebServer {
     /// 服务器端口
     port: u16,
-    /// 服务器状态
-    state: WebState,
+    /// 服务器状态（使用 Arc 共享）
+    state: Arc<WebState>,
 }
 
 impl WebServer {
@@ -1564,7 +1609,11 @@ impl WebServer {
     pub fn new(port: u16) -> Self {
         Self {
             port,
-            state: WebState {
+            state: Arc::new(WebState {
+                id: format!("{:x}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()),
                 message_stats: Arc::new(RwLock::new(MessageStats::default())),
                 conversation_history: Arc::new(RwLock::new(Vec::new())),
                 config: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1574,7 +1623,7 @@ impl WebServer {
                 channel_status: Arc::new(RwLock::new(HashMap::new())),
                 auth_config: Arc::new(RwLock::new(AuthConfig::default())),
                 ws_manager: Arc::new(WebSocketManager::new()),
-            },
+            }),
         }
     }
 
@@ -1627,8 +1676,13 @@ impl WebServer {
     }
 
     /// 获取状态
-    pub fn state(&self) -> &WebState {
-        &self.state
+    pub fn state(&self) -> Arc<WebState> {
+        self.state.clone()
+    }
+
+    /// 获取内部状态引用（用于路由）
+    fn state_ref(&self) -> &WebState {
+        &*self.state
     }
 
     /// 创建 Axum 路由
@@ -1643,7 +1697,7 @@ impl WebServer {
             .route("/ws", get(ws_handler))
             // WebSocket 状态
             .route("/api/ws/status", get(ws_status_handler))
-            .with_state(self.state.clone());
+            .with_state(self.state_ref().clone());
 
         // 创建受保护的路由（需要认证）
         // 创建认证中间件状态
@@ -1692,7 +1746,7 @@ impl WebServer {
                 auth_middleware,
             ))
             // 添加主状态
-            .with_state(self.state.clone());
+            .with_state(self.state_ref().clone());
 
         // 合并路由
         public_routes.merge(protected_routes)

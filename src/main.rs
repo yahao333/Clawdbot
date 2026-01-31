@@ -1,5 +1,6 @@
 //! Clawdbot 主入口
 
+use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -97,7 +98,21 @@ async fn run_service(config_path: &str, port: u16, web_port: u16) {
         ..Default::default()
     };
 
-    let mut service = ClawdbotService::new(service_config);
+    // 创建 Web 服务器（如果需要）
+    let web_server = if web_port > 0 {
+        Some(clawdbot::web::WebServer::new(web_port))
+    } else {
+        None
+    };
+
+    // 获取 Web 状态（用于仪表盘数据更新）
+    let web_state: Arc<clawdbot::web::WebState> = if let Some(ref ws) = web_server {
+        ws.state().clone()
+    } else {
+        Arc::new(clawdbot::web::WebState::new())
+    };
+
+    let mut service = ClawdbotService::new(service_config, web_state);
 
     if let Err(e) = service.initialize(config_path).await {
         error!(error = %e, "服务初始化失败");
@@ -106,7 +121,8 @@ async fn run_service(config_path: &str, port: u16, web_port: u16) {
 
     // 启动 Web 服务器（如果指定了端口）
     if web_port > 0 {
-        let web_server = clawdbot::web::WebServer::new(web_port);
+        // 使用之前创建的 web_server，而不是创建新的实例
+        let web_server = web_server.unwrap();  // 获取之前创建的 WebServer
 
         // 读取并应用 Web 认证配置
         let web_auth_enabled = std::env::var("WEB_AUTH_ENABLED")

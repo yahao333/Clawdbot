@@ -53,10 +53,12 @@ pub struct ClawdbotService {
     shutdown_tx: broadcast::Sender<()>,
     /// 加载的配置
     loaded_config: Arc<Option<Config>>,
+    /// Web 状态（用于仪表盘数据更新）
+    pub web_state: Arc<crate::web::WebState>,
 }
 
 impl ClawdbotService {
-    pub fn new(config: ServiceConfig) -> Self {
+    pub fn new(config: ServiceConfig, web_state: Arc<crate::web::WebState>) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Self {
@@ -64,6 +66,7 @@ impl ClawdbotService {
             status: Arc::new(tokio::sync::RwLock::new(ServiceStatus::Initializing)),
             shutdown_tx,
             loaded_config: Arc::new(None),
+            web_state,
         }
     }
 
@@ -145,14 +148,24 @@ impl ClawdbotService {
         let feishu_sender = Arc::new(FeishuMessageSender::from_client((*feishu_client).clone()));
         sender.register("feishu", feishu_sender).await;
 
-        let handler_context = HandlerContext::new(
+        // 创建 HandlerContext（带 Web 状态）
+        let handler_context = HandlerContext::new_with_web_state(
             Arc::new(config.clone()),
             message_queue.clone(),
             router.clone(),
             ai_engine.clone(),
             sender,
             session_manager,
+            self.web_state.clone(),
         );
+
+        // 更新飞书渠道状态为已连接
+        self.web_state.update_channel_status("feishu", crate::web::ChannelConnectionStatus {
+            connected: true,
+            last_connected: Some(chrono::Utc::now().to_rfc3339()),
+            last_error: None,
+            message_count: 0,
+        }).await;
 
         // 启动消息队列处理循环
         let ctx_clone = handler_context.clone();
@@ -228,6 +241,6 @@ impl ClawdbotService {
 
 impl Default for ClawdbotService {
     fn default() -> Self {
-        Self::new(ServiceConfig::default())
+        Self::new(ServiceConfig::default(), Arc::new(crate::web::WebState::new()))
     }
 }

@@ -25,6 +25,7 @@ use crate::core::routing::Router;
 use crate::core::agent::AiEngine;
 use crate::core::session::SessionManager;
 use crate::infra::error::Result;
+use crate::web;
 
 /// 消息处理上下文
 ///
@@ -37,6 +38,7 @@ use crate::infra::error::Result;
 /// * `ai_engine` - AI 引擎（用于生成响应）
 /// * `sender` - 消息发送器（用于发送响应）
 /// * `session_manager` - 会话管理器（用于会话管理和消息去重）
+/// * `web_state` - Web 状态（用于仪表盘数据更新，可选）
 #[derive(Clone)]
 pub struct HandlerContext {
     /// 配置
@@ -51,6 +53,8 @@ pub struct HandlerContext {
     sender: Arc<dyn MessageSender>,
     /// 会话管理器
     session_manager: Arc<SessionManager>,
+    /// Web 状态（用于仪表盘数据更新）
+    web_state: Option<Arc<web::WebState>>,
 }
 
 impl HandlerContext {
@@ -63,6 +67,7 @@ impl HandlerContext {
     /// * `ai_engine` - AI 引擎
     /// * `sender` - 消息发送器
     /// * `session_manager` - 会话管理器
+    /// * `web_state` - Web 状态（可选，用于仪表盘数据更新）
     ///
     /// # 返回值
     /// 创建的上下文
@@ -81,7 +86,39 @@ impl HandlerContext {
             ai_engine,
             sender,
             session_manager,
+            web_state: None,
         }
+    }
+
+    /// 创建消息处理上下文（带 Web 状态）
+    pub fn new_with_web_state(
+        config: Arc<super::super::super::infra::config::Config>,
+        queue: Arc<MessageQueue>,
+        router: Arc<dyn Router>,
+        ai_engine: Arc<dyn AiEngine>,
+        sender: Arc<dyn MessageSender>,
+        session_manager: Arc<SessionManager>,
+        web_state: Arc<web::WebState>,
+    ) -> Self {
+        Self {
+            config,
+            queue,
+            router,
+            ai_engine,
+            sender,
+            session_manager,
+            web_state: Some(web_state),
+        }
+    }
+
+    /// 检查是否有 Web 状态
+    pub fn has_web_state(&self) -> bool {
+        self.web_state.is_some()
+    }
+
+    /// 获取 Web 状态（如果存在）
+    pub fn web_state(&self) -> Option<&Arc<web::WebState>> {
+        self.web_state.as_ref()
     }
 }
 
@@ -270,27 +307,94 @@ impl DefaultMessageHandler {
              }
         };
 
+        // 保存响应文本供后续使用
+        let response_text = response.text.clone();
+
         // 添加助手响应到会话历史
-        if let Some(ref text) = response.text {
+        if let Some(ref text) = response_text {
             ctx.session_manager.add_message_to_session(&session.id, "assistant", text).await;
         }
 
         // 6. 发送响应
         debug!("准备发送响应");
-        if let Some(resp_content) = response.text {
+        let send_result = if let Some(ref resp_content) = response_text {
              let outbound = OutboundMessage {
                 target_id: message.target.id.clone(), // 回复给同一个目标
                 channel: message.channel.clone(),     // 使用相同的渠道
-                content: super::types::MessageContent::text(&resp_content),
+                content: super::types::MessageContent::text(resp_content),
                 thread_id: None,
                 enable_push: Some(true),
                 card: None,
             };
 
             match ctx.sender.send(outbound).await {
-                Ok(msg_id) => info!(response_id = %msg_id, "响应发送成功"),
-                Err(e) => tracing::error!(error = %e, "响应发送失败"),
+                Ok(msg_id) => {
+                    info!(response_id = %msg_id, "响应发送成功");
+                    true
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "响应发送失败");
+                    false
+                }
             }
+        } else {
+            false
+        };
+
+        // 更新 Web 仪表盘数据
+        if let Some(web_state) = ctx.web_state() {
+            let mut stats = web_state.message_stats.write().await;
+            stats.today_messages += 1;
+            stats.total_messages += 1;
+            stats.feishu_messages += 1;
+
+            // 更新 Token 统计（从 AI 引擎获取使用情况）
+            // 注意：当前 execute 返回类型不包含 usage，需要后续完善
+            // 暂时不更新 Token 统计
+
+            // 更新 AI 请求统计
+            stats.ai_requests_total += 1;
+            if send_result {
+                stats.ai_requests_success += 1;
+            } else {
+                stats.ai_requests_failed += 1;
+            }
+
+            // 更新活跃会话数
+            stats.active_sessions = ctx.session_manager.session_count().await as u64;
+
+            // 通过 WebSocket 广播统计更新
+            web_state.ws_manager.send_stats_update(stats.clone());
+        }
+
+        // 添加消息到对话历史（用于仪表盘显示）
+        if let Some(web_state) = ctx.web_state() {
+            let new_conversation = crate::web::Conversation {
+                id: message_id.clone(),
+                channel: message.channel.clone(),
+                user_id: message.sender.id.clone(),
+                user_name: message.sender.display_name.clone(),
+                message: message_content.clone(),
+                response: response_text.clone().unwrap_or_default(),
+                tokens: 0, // 暂时设为 0，后续完善
+                timestamp: chrono::Utc::now(),
+            };
+
+            let conversation_for_broadcast = new_conversation.clone();
+
+            let mut history = web_state.conversation_history.write().await;
+            history.push(new_conversation);
+
+            // 限制历史数量（保留最近 100 条）
+            if history.len() > 100 {
+                let to_remove = history.len() - 100;
+                for _ in 0..to_remove {
+                    history.remove(0);
+                }
+            }
+
+            // 广播新消息
+            web_state.ws_manager.broadcast(crate::web::WebSocketMessage::NewMessage(conversation_for_broadcast));
         }
 
         info!(message_id = %message_id, session_id = %session.id, "消息处理完成");
