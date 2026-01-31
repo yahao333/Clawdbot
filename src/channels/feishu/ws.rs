@@ -553,9 +553,15 @@ impl FeishuWsMonitor {
                     info!(full_content = %serde_json::to_string_pretty(&content).unwrap_or_default(), "完整事件数据");
 
                     if event_type == "im.message.receive_v1" {
+                        let event_data = if let Some(e) = content.get("event") {
+                            e.clone()
+                        } else {
+                            content.clone()
+                        };
+
                         Self::handle_message_event(
                             &id,
-                            content,
+                            event_data,
                             processed_messages,
                             event_handler,
                             handler_context,
@@ -684,14 +690,26 @@ impl FeishuWsMonitor {
             message_id = ?message_id,
             "去重检查: 提取 message_id"
         );
-        let dedupe_key = message_id.unwrap_or_else(|| event_id.to_string());
+        let dedupe_key = match message_id {
+            Some(id) => id,
+            None => {
+                warn!(event_id = %event_id, "无法提取 message_id，回退使用 event_id 进行去重（可能不可靠）");
+                event_id.to_string()
+            }
+        };
 
-        if processed_messages.contains_key(&dedupe_key) {
-            debug!(message_id = %dedupe_key, "消息已处理过，跳过");
-            return;
+        // 使用 DashMap 的 entry API 进行原子检查和插入
+        // 这可以防止并发竞争导致的重复处理
+        use dashmap::mapref::entry::Entry;
+        match processed_messages.entry(dedupe_key.clone()) {
+            Entry::Occupied(_) => {
+                warn!(message_id = %dedupe_key, "检测到重复消息（并发竞争），跳过");
+                return;
+            },
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+            }
         }
-
-        processed_messages.insert(dedupe_key.clone(), now);
 
         // 构建事件请求
         let event_request = FeishuEventRequest {
