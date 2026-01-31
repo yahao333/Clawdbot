@@ -49,6 +49,18 @@ pub struct AiEngine {
     max_history: usize,
 }
 
+impl std::fmt::Debug for AiEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiEngine")
+            .field("registry", &self.registry)
+            .field("config", &"AiConfig") // Config might contain secrets, so maybe just show placeholder or rely on its Debug impl
+            .field("default_provider", &self.default_provider)
+            .field("conversation_history_count", &self.conversation_history.len())
+            .field("max_history", &self.max_history)
+            .finish()
+    }
+}
+
 impl AiEngine {
     /// 创建新的 AI 引擎
     ///

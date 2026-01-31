@@ -126,7 +126,7 @@ impl ClawdbotService {
         let router: Arc<dyn crate::core::routing::Router> = Arc::new(DefaultRouter::new("default"));
         let queue_config = QueueConfig::default();
         let message_queue = Arc::new(MessageQueue::new(queue_config));
-        let ai_engine: Arc<dyn AiEngine> = Arc::new(DefaultAiEngine::new());
+        let ai_engine: Arc<dyn AiEngine> = Arc::new(DefaultAiEngine::new(config));
         // 数据库初始化暂时跳过
         // let database = Arc::new(Database::new("data/clawdbot.db").await?);
 

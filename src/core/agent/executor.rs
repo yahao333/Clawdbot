@@ -6,6 +6,7 @@ use tracing::{debug, info, instrument};
 
 use crate::core::message::types::{InboundMessage, MessageContent};
 use crate::infra::error::Result;
+use crate::ai::engine::AiEngine as CoreAiEngine;
 
 /// AI 引擎 Trait
 ///
@@ -100,47 +101,15 @@ pub struct AiResponse {
     pub done: bool,
 }
 
-/// 默认 AI 引擎实现
-///
-/// 标准 AI 引擎实现
-#[derive(Clone, Debug)]
-pub struct DefaultAiEngine {
-    // TODO: 实现 AI 引擎
-}
-
-impl DefaultAiEngine {
-    /// 创建新的 AI 引擎
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
 #[async_trait::async_trait]
-impl AiEngine for DefaultAiEngine {
+impl AiEngine for CoreAiEngine {
     #[instrument(skip(self, message), fields(agent_id))]
     async fn execute(
         &self,
         agent_id: &str,
         message: &InboundMessage,
     ) -> Result<MessageContent> {
-        debug!(agent_id = agent_id, "开始执行 Agent");
-
-        // TODO: 实现实际的 AI 调用
-        // 这里需要：
-        // 1. 获取 Agent 配置
-        // 2. 构建消息历史
-        // 3. 调用 AI Provider
-        // 4. 返回响应
-
-        // 模拟响应（实际实现时移除）
-        let text = message.content.text.clone()
-            .or(message.content.rich_text.as_ref().map(|rt| rt.content.clone()))
-            .unwrap_or_else(String::new);
-        let response_text = format!("收到消息: {}", text);
-
-        info!(agent_id = agent_id, "Agent 执行完成");
-
-        Ok(MessageContent::text(&response_text))
+        self.execute(agent_id, message).await
     }
 
     async fn execute_stream(
@@ -148,9 +117,40 @@ impl AiEngine for DefaultAiEngine {
         agent_id: &str,
         message: &InboundMessage,
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
-        // TODO: 实现流式响应
-        Err(AiEngineError::AgentNotFound {
-            agent_id: agent_id.to_string(),
-        }.into())
+        self.execute_stream(agent_id, message).await
+    }
+}
+
+/// 默认 AI 引擎实现（已弃用，请使用 CoreAiEngine）
+#[derive(Clone, Debug)]
+pub struct DefaultAiEngine {
+    inner: CoreAiEngine,
+}
+
+impl DefaultAiEngine {
+    /// 创建新的 AI 引擎
+    pub fn new(config: &crate::infra::config::Config) -> Self {
+        Self {
+            inner: CoreAiEngine::new(config),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AiEngine for DefaultAiEngine {
+    async fn execute(
+        &self,
+        agent_id: &str,
+        message: &InboundMessage,
+    ) -> Result<MessageContent> {
+        self.inner.execute(agent_id, message).await
+    }
+
+    async fn execute_stream(
+        &self,
+        agent_id: &str,
+        message: &InboundMessage,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.inner.execute_stream(agent_id, message).await
     }
 }
