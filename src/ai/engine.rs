@@ -137,6 +137,19 @@ impl AiEngine {
                     registry.register(provider);
                     info!(provider = %name, "OpenAI Provider 注册成功");
                 }
+                "minimax" => {
+                    let config = super::provider::minimax::MiniMaxConfig {
+                        api_key: provider_config.api_key.clone().unwrap_or_default(),
+                        group_id: provider_config.group_id.clone().unwrap_or_default(),
+                        model: provider_config.model.clone(),
+                        temperature: provider_config.temperature,
+                        max_tokens: provider_config.max_tokens,
+                        base_url: None,
+                    };
+                    let provider = super::provider::minimax::MiniMaxProvider::new(config);
+                    registry.register(provider);
+                    info!(provider = %name, "MiniMax Provider 注册成功");
+                }
                 _ => {
                     warn!(provider = %name, "未支持的 Provider 类型");
                 }

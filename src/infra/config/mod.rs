@@ -155,6 +155,23 @@ impl ConfigLoader {
             if let Some(base_url) = &provider.base_url {
                 provider.base_url = Some(self.replace_env_vars(base_url));
             }
+            if let Some(model) = &provider.model {
+                provider.model = Some(self.replace_env_vars(model));
+            }
+            if let Some(temperature) = &provider.temperature {
+                // 温度可能是 `${TEMPERATURE}` 格式
+                let temp_str = temperature.to_string();
+                if temp_str.starts_with("${") {
+                    provider.temperature = self.replace_env_vars(&temp_str).parse().ok().or(Some(*temperature));
+                }
+            }
+            if let Some(max_tokens) = &provider.max_tokens {
+                // Max tokens 可能是 `${MAX_TOKENS}` 格式
+                let tokens_str = max_tokens.to_string();
+                if tokens_str.starts_with("${") {
+                    provider.max_tokens = self.replace_env_vars(&tokens_str).parse().ok().or(Some(*max_tokens));
+                }
+            }
         }
 
         // 替换渠道配置中的环境变量

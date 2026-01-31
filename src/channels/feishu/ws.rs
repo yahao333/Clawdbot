@@ -34,6 +34,22 @@ impl Default for WsConfig {
     }
 }
 
+impl WsConfig {
+    /// 从事件数据中提取 message_id
+    ///
+    /// 飞书 WebSocket 事件中，message_id 在 message.message_id 字段
+    /// 使用 message_id 而不是 event_id 进行去重，因为飞书的 event_id 每次推送都不同
+    fn extract_message_id(event_data: &serde_json::Value) -> Option<String> {
+        // event_data 已经是 event 对象，直接从 message.message_id 提取
+        if let Some(message_id) = event_data.get("message")
+            .and_then(|m| m.get("message_id"))
+        {
+            return message_id.as_str().map(|s| s.to_string());
+        }
+        None
+    }
+}
+
 /// 飞书 WebSocket 消息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
@@ -598,15 +614,25 @@ impl FeishuWsMonitor {
     ) {
         let now = Instant::now();
 
-        // 清理过期条目
+        // 清理过期条目 (保留 5 分钟)
         processed_messages.retain(|_, &mut v| now.duration_since(v) < Duration::from_secs(300));
 
-        if processed_messages.contains_key(event_id) {
-            debug!(event_id = %event_id, "消息已处理过，跳过");
+        // 从事件数据中提取 message_id 进行去重
+        // 注意：飞书的 event_id 每次推送都不同，但 message_id 是消息的唯一标识
+        let message_id = WsConfig::extract_message_id(&event_data);
+        debug!(
+            event_id = %event_id,
+            message_id = ?message_id,
+            "去重检查: 提取 message_id"
+        );
+        let dedupe_key = message_id.unwrap_or_else(|| event_id.to_string());
+
+        if processed_messages.contains_key(&dedupe_key) {
+            debug!(message_id = %dedupe_key, "消息已处理过，跳过");
             return;
         }
 
-        processed_messages.insert(event_id.to_string(), now);
+        processed_messages.insert(dedupe_key.clone(), now);
 
         // 构建事件请求
         let event_request = FeishuEventRequest {
