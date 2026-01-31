@@ -174,7 +174,7 @@ impl FeishuMessageSender {
     /// }
     /// ```
     pub async fn send_card(&self, receiver: &MessageReceiver, card: &Value) -> Result<SendMessageResponse> {
-        self.send_raw(receiver, "card", card.clone()).await
+        self.send_raw(receiver, "interactive", card.clone()).await
     }
 
     /// 发送 Markdown 卡片消息

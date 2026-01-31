@@ -188,8 +188,8 @@ impl FeishuClient {
         }
     }
 
-    /// 获取 HTTP 客户端（仅供内部模块使用）
-    pub(crate) fn http_client(&self) -> &reqwest::Client {
+    /// 获取 HTTP 客户端（用于自定义请求）
+    pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
     }
 
