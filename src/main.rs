@@ -5,6 +5,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use clawdbot::service::{ClawdbotService, ServiceConfig};
+use clawdbot::web::ServiceStatus;
 
 // 命令行参数解析结构体
 #[derive(Parser, Debug)]
@@ -106,13 +107,36 @@ async fn run_service(config_path: &str, port: u16, web_port: u16) {
     // 启动 Web 服务器（如果指定了端口）
     if web_port > 0 {
         let web_server = clawdbot::web::WebServer::new(web_port);
-        // TODO: 从服务状态中获取配置信息
-        let web_state = web_server.state().clone();
+
+        // 读取并应用 Web 认证配置
+        let web_auth_enabled = std::env::var("WEB_AUTH_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true";
+        let web_auth_username = std::env::var("WEB_AUTH_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let web_auth_password = std::env::var("WEB_AUTH_PASSWORD").unwrap_or_else(|_| "password".to_string());
+
+        if web_auth_enabled {
+            web_server.configure_auth(&web_auth_username, &web_auth_password);
+            info!(username = web_auth_username, "Web 认证已启用");
+        } else {
+            web_server.disable_auth();
+            info!("Web 认证已禁用");
+        }
+
+        // 设置服务状态为初始化中
+        web_server.set_service_status(ServiceStatus::Initializing);
 
         // 在后台启动 Web 服务器
+        let web_server_clone = web_server.clone();
         tokio::spawn(async move {
-            if let Err(e) = web_server.start().await {
+            // 设置服务状态为运行中
+            web_server_clone.set_service_status(ServiceStatus::Running);
+
+            // 启动 Web 服务器
+            if let Err(e) = web_server_clone.start().await {
                 error!(error = %e, "Web 服务器启动失败");
+                // 设置服务状态为错误
+                web_server_clone.set_service_status(ServiceStatus::Error(e.to_string()));
             }
         });
 

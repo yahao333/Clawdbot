@@ -374,6 +374,7 @@ dependencies = [
  "dotenv",
  "fake",
  "futures",
+ "futures-util",
  "hex",
  "hmac",
  "humantime",

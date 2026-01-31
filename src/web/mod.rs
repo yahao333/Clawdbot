@@ -8,16 +8,167 @@ use axum::{
     extract::{State, Query},
     response::{Html, IntoResponse},
     Json,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
 };
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::RwLock;
-use tracing::{info, error};
+use tokio::sync::{RwLock, broadcast, Mutex};
+use tracing::{info, error, debug};
 use serde::{Serialize, Deserialize};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-// ==================== 类型定义 ====================
+/// Web 认证配置
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    /// 是否启用认证
+    pub enabled: bool,
+    /// 用户名
+    pub username: String,
+    /// 密码（bcrypt 或 plaintext）
+    pub password: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+// ==================== WebSocket 消息类型 ====================
+
+/// WebSocket 消息类型
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum WebSocketMessage {
+    /// 统计更新
+    #[serde(rename = "stats_update")]
+    StatsUpdate(MessageStats),
+    /// 服务状态变更
+    #[serde(rename = "status_change")]
+    StatusChange {
+        status: String,
+        message: Option<String>,
+    },
+    /// 新消息
+    #[serde(rename = "new_message")]
+    NewMessage(Conversation),
+    /// 告警通知
+    #[serde(rename = "alert")]
+    Alert {
+        level: String,
+        title: String,
+        message: String,
+        timestamp: String,
+    },
+    /// 渠道状态变更
+    #[serde(rename = "channel_status")]
+    ChannelStatus {
+        channel: String,
+        connected: bool,
+        message: Option<String>,
+    },
+    /// 心跳消息
+    #[serde(rename = "ping")]
+    Ping,
+    /// Pong 响应
+    #[serde(rename = "pong")]
+    Pong,
+}
+
+impl WebSocketMessage {
+    /// 将消息转换为 JSON 字符串
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// WebSocket 连接管理器
+#[derive(Clone)]
+pub struct WebSocketManager {
+    /// 广播 sender，用于向所有连接的客户端发送消息
+    tx: broadcast::Sender<WebSocketMessage>,
+    /// 当前连接的客户端数量
+    client_count: Arc<RwLock<u32>>,
+}
+
+impl WebSocketManager {
+    /// 创建新的 WebSocket 管理器
+    pub fn new() -> Self {
+        // 创建一个广播 channel，容量为 100
+        let (tx, _) = broadcast::channel(100);
+        Self {
+            tx,
+            client_count: Arc::new(RwLock::new(0)),
+        }
+    }
+
+    /// 获取广播 sender
+    pub fn sender(&self) -> broadcast::Sender<WebSocketMessage> {
+        self.tx.clone()
+    }
+
+    /// 增加客户端计数
+    pub async fn add_client(&self) {
+        let mut count = self.client_count.write().await;
+        *count += 1;
+        tracing::info!(client_count = *count, "新的 WebSocket 客户端已连接");
+    }
+
+    /// 减少客户端计数
+    pub async fn remove_client(&self) {
+        let mut count = self.client_count.write().await;
+        *count = count.saturating_sub(1);
+        tracing::info!(client_count = *count, "WebSocket 客户端已断开");
+    }
+
+    /// 获取当前客户端数量
+    pub async fn get_client_count(&self) -> u32 {
+        *self.client_count.read().await
+    }
+
+    /// 广播消息到所有客户端
+    pub fn broadcast(&self, message: WebSocketMessage) {
+        // 忽略发送失败（客户端可能已断开）
+        let _ = self.tx.send(message);
+    }
+
+    /// 发送统计更新
+    pub fn send_stats_update(&self, stats: MessageStats) {
+        self.broadcast(WebSocketMessage::StatsUpdate(stats));
+    }
+
+    /// 发送服务状态变更
+    pub fn send_status_change(&self, status: ServiceStatus) {
+        let (status_str, message) = match &status {
+            ServiceStatus::Running => ("running".to_string(), None),
+            ServiceStatus::Initializing => ("initializing".to_string(), None),
+            ServiceStatus::Stopping => ("stopping".to_string(), None),
+            ServiceStatus::Stopped => ("stopped".to_string(), None),
+            ServiceStatus::Error(msg) => ("error".to_string(), Some(msg.clone())),
+        };
+        self.broadcast(WebSocketMessage::StatusChange {
+            status: status_str,
+            message,
+        });
+    }
+
+    /// 发送告警
+    pub fn send_alert(&self, level: &str, title: &str, message: &str) {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        self.broadcast(WebSocketMessage::Alert {
+            level: level.to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+            timestamp,
+        });
+    }
+}
 
 /// Web 服务器状态
 #[derive(Clone)]
@@ -31,15 +182,89 @@ pub struct WebState {
     pub config: Arc<tokio::sync::Mutex<Option<super::infra::config::Config>>>,
     /// 审计服务（可选）
     pub audit_service: Arc<RwLock<Option<super::security::AuditService>>>,
+    /// 服务状态（用于健康检查）
+    pub service_status: Arc<RwLock<ServiceStatus>>,
+    /// AI 引擎状态
+    pub ai_engine_status: Arc<RwLock<AIEngineStatus>>,
+    /// 渠道连接状态
+    pub channel_status: Arc<RwLock<HashMap<String, ChannelConnectionStatus>>>,
+    /// 认证配置
+    pub auth_config: Arc<RwLock<AuthConfig>>,
+    /// WebSocket 管理器
+    pub ws_manager: Arc<WebSocketManager>,
 }
 
-/// 消息统计
+// ==================== 类型定义 ====================
+
+/// 服务状态枚举
+/// 用于健康检查和就绪检查
+#[derive(Debug, Clone, Serialize, Default)]
+pub enum ServiceStatus {
+    /// 服务正在初始化
+    #[default]
+    Initializing,
+    /// 服务正在运行
+    Running,
+    /// 服务正在停止
+    Stopping,
+    /// 服务已停止
+    Stopped,
+    /// 服务发生错误
+    Error(String),
+}
+
+/// AI 引擎状态
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct AIEngineStatus {
+    pub is_running: bool,
+    pub active_providers: Vec<String>,
+    pub default_provider: String,
+    pub last_error: Option<String>,
+}
+
+/// 渠道连接状态
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ChannelConnectionStatus {
+    pub connected: bool,
+    pub last_connected: Option<String>,
+    pub last_error: Option<String>,
+    pub message_count: u64,
+}
+
+/// 消息统计 - 增强版
+/// 包含更多维度的监控指标
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct MessageStats {
-    pub total_messages: u64,
-    pub today_messages: u64,
-    pub total_tokens: u64,
-    pub today_tokens: u64,
+    // 消息计数
+    pub total_messages: u64,          // 总消息数
+    pub today_messages: u64,          // 今日消息数
+    pub successful_messages: u64,     // 成功处理的消息数
+    pub failed_messages: u64,         // 处理失败的消息数
+
+    // Token 统计
+    pub total_tokens: u64,            // 总 Token 数
+    pub today_tokens: u64,            // 今日 Token 数
+    pub total_input_tokens: u64,      // 总输入 Token
+    pub total_output_tokens: u64,     // 总输出 Token
+
+    // 渠道统计
+    pub feishu_messages: u64,         // 飞书消息数
+    pub telegram_messages: u64,       // Telegram 消息数
+    pub discord_messages: u64,        // Discord 消息数
+
+    // 性能统计
+    pub avg_response_time_ms: f64,    // 平均响应时间（毫秒）
+    pub max_response_time_ms: u64,    // 最大响应时间（毫秒）
+    pub min_response_time_ms: u64,    // 最小响应时间（毫秒）
+
+    // AI 统计
+    pub ai_requests_total: u64,       // AI 请求总数
+    pub ai_requests_success: u64,     // AI 请求成功数
+    pub ai_requests_failed: u64,      // AI 请求失败数
+
+    // 会话统计
+    pub active_sessions: u64,         // 当前活跃会话数
+    pub total_sessions: u64,          // 历史会话总数
 }
 
 /// 对话记录
@@ -80,6 +305,247 @@ pub struct ConfigUpdateRequest {
     pub value: JsonValue,
 }
 
+// ==================== 认证中间件 ====================
+
+/// 认证中间件状态
+/// 用于在中间件中传递认证配置
+#[derive(Clone)]
+struct AuthMiddlewareState {
+    auth_config: Arc<RwLock<AuthConfig>>,
+}
+
+impl AuthMiddlewareState {
+    fn new(auth_config: Arc<RwLock<AuthConfig>>) -> Self {
+        Self { auth_config }
+    }
+}
+
+/// Basic Auth 认证中间件
+/// 检查请求的 Authorization 头，验证用户名和密码
+async fn auth_middleware(
+    State(auth_state): State<AuthMiddlewareState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, std::convert::Infallible> {
+    // 获取认证配置
+    let auth_config = auth_state.auth_config.read().await;
+
+    // 如果认证未启用，直接放行
+    if !auth_config.enabled {
+        debug!("认证已跳过（未启用）");
+        return Ok(next.run(request).await);
+    }
+
+    // 记录调试信息
+    debug!(enabled = auth_config.enabled, username = auth_config.username, "认证检查");
+
+    // 检查 Authorization 头
+    let auth_header = request.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .map(|v| v.to_str().unwrap_or(""));
+
+    match auth_header {
+        Some("") | None => {
+            // 没有 Authorization 头，返回 401
+            debug!("认证失败：缺少 Authorization 头");
+            return create_401_response();
+        }
+        Some(auth) if auth.starts_with("Basic ") => {
+            // 解析 Basic Auth
+            let credentials = auth.trim_start_matches("Basic ");
+            match STANDARD.decode(credentials) {
+                Ok(decoded) => {
+                    let credentials_str = String::from_utf8_lossy(&decoded);
+                    debug!("解码后的凭据: {}", credentials_str);
+
+                    let parts: Vec<&str> = credentials_str.split(':').collect();
+                    if parts.len() >= 2 {
+                        let username = parts[0];
+                        let password = parts[1..].join(":");
+
+                        debug!(input_username = username, expected_username = auth_config.username);
+                        debug!(password_match = (password == auth_config.password));
+
+                        // 验证凭据
+                        if username == auth_config.username && password == auth_config.password {
+                            debug!("认证成功");
+                            return Ok(next.run(request).await);
+                        } else {
+                            debug!("认证失败：凭据错误");
+                            return create_401_response();
+                        }
+                    } else {
+                        debug!("认证失败：凭据格式错误");
+                        return create_401_response();
+                    }
+                }
+                Err(e) => {
+                    debug!(error = ?e, "认证失败：Base64 解码失败");
+                    return create_401_response();
+                }
+            }
+        }
+        Some(auth) => {
+            debug!(auth_type = %auth, "认证失败：不支持的认证方式");
+            return create_401_response();
+        }
+    }
+}
+
+/// 创建 401 Unauthorized 响应
+fn create_401_response() -> Result<axum::response::Response, std::convert::Infallible> {
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::UNAUTHORIZED)
+        .header(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"Clawdbot\"")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    Ok(response)
+}
+
+// ==================== WebSocket 处理器 ====================
+
+/// WebSocket 连接处理器
+/// 处理 WebSocket 连接，接收和发送消息
+async fn ws_handler(
+    State(state): State<WebState>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    let ws_manager = state.ws_manager.clone();
+
+    ws.on_upgrade(move |socket| {
+        handle_socket(ws_manager, socket)
+    })
+}
+
+/// 处理 WebSocket 连接的核心逻辑
+async fn handle_socket(ws_manager: Arc<WebSocketManager>, ws: WebSocket) {
+    use futures_util::{StreamExt, SinkExt};
+
+    // 增加客户端计数
+    ws_manager.add_client().await;
+
+    // 获取广播 receiver
+    let mut rx = ws_manager.sender().subscribe();
+
+    let (sink, stream) = ws.split();
+    let sink = Arc::new(Mutex::new(sink));
+    let stream = std::pin::Pin::new(Box::new(stream));
+
+    // 任务1：接收客户端消息
+    let receive_task = async {
+        let mut stream = stream;
+        let sink = sink.clone();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(Message::Text(text)) => {
+                    tracing::debug!(message = %text, "收到 WebSocket 消息");
+                    handle_ws_message(&text, &ws_manager).await;
+                }
+                Ok(Message::Binary(data)) => {
+                    tracing::debug!(length = data.len(), "收到二进制消息");
+                }
+                Ok(Message::Ping(_)) => {
+                    let mut guard = sink.lock().await;
+                    let _ = guard.send(Message::Pong(vec![])).await;
+                }
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => {
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "WebSocket 接收错误");
+                    break;
+                }
+            }
+        }
+    };
+
+    // 任务2：广播消息到客户端
+    let broadcast_task = async {
+        let mut rx = rx;
+        let sink = sink.clone();
+        while let Ok(message) = rx.recv().await {
+            let json = message.to_json();
+            let mut guard = sink.lock().await;
+            if guard.send(Message::Text(json)).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // 并发执行两个任务
+    tokio::select! {
+        _ = receive_task => {},
+        _ = broadcast_task => {},
+    }
+
+    // 减少客户端计数
+    ws_manager.remove_client().await;
+}
+
+/// 处理 WebSocket 客户端消息
+async fn handle_ws_message(text: &str, _ws_manager: &WebSocketManager) {
+    // 解析消息类型
+    if let Ok(message) = serde_json::from_str::<serde_json::Value>(text) {
+        let msg_type = message.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match msg_type {
+            "ping" => {
+                // 心跳消息，客户端要求响应 pong
+                // 实际响应在 broadcast_task 中处理
+                tracing::debug!("收到心跳消息");
+            }
+            "subscribe" => {
+                // 订阅特定事件
+                tracing::debug!(message = %text, "订阅请求");
+            }
+            "unsubscribe" => {
+                // 取消订阅
+                tracing::debug!(message = %text, "取消订阅请求");
+            }
+            _ => {
+                tracing::debug!(msg_type = msg_type, "未知的 WebSocket 消息类型");
+            }
+        }
+    }
+}
+
+/// 获取 WebSocket 连接状态的处理器
+async fn ws_status_handler(State(state): State<WebState>) -> Json<JsonValue> {
+    let client_count = state.ws_manager.get_client_count().await;
+    Json(json!({
+        "connected": true,
+        "client_count": client_count,
+        "url": "ws://localhost/ws"
+    }))
+}
+
+// ==================== 认证 API ====================
+
+/// 登出处理器
+/// 清除浏览器缓存的 Basic Auth 凭据
+/// 通过返回 401 并设置认证头，浏览器会弹出新的认证框
+async fn logout_handler() -> Result<axum::response::Response, std::convert::Infallible> {
+    info!("用户请求登出");
+
+    // 返回 401 并清除 WWW-Authenticate 头
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::UNAUTHORIZED)
+        .header(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"Clawdbot\", charset=\"UTF-8\"")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    Ok(response)
+}
+
+/// 获取当前认证状态的处理器
+async fn auth_status_handler(State(state): State<WebState>) -> Json<JsonValue> {
+    let auth_config = state.auth_config.read().await;
+    Json(json!({
+        "enabled": auth_config.enabled,
+        "username": if auth_config.enabled { &auth_config.username } else { "" },
+    }))
+}
+
 // ==================== 路由处理器 ====================
 
 // 首页
@@ -100,6 +566,207 @@ async fn config_handler() -> Html<&'static str> {
 // 运营数据页面
 async fn operations_handler() -> Html<&'static str> {
     Html(HTML_OPERATIONS)
+}
+
+// ==================== 健康检查端点 ====================
+
+/// 健康检查端点（Liveness Probe）
+/// 用于 Kubernetes 检查容器是否存活
+/// 返回 200 表示服务正常运行
+async fn health_handler(State(state): State<WebState>) -> (axum::http::StatusCode, &'static str) {
+    let status = state.service_status.read().await;
+    match &*status {
+        ServiceStatus::Running => {
+            (axum::http::StatusCode::OK, "OK")
+        }
+        ServiceStatus::Initializing => {
+            (axum::http::StatusCode::OK, "Initializing")
+        }
+        ServiceStatus::Stopping => {
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Stopping")
+        }
+        ServiceStatus::Stopped => {
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Stopped")
+        }
+        ServiceStatus::Error(msg) => {
+            tracing::warn!(error = %msg, "健康检查失败");
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Error")
+        }
+    }
+}
+
+/// 就绪检查端点（Readiness Probe）
+/// 用于 Kubernetes 检查服务是否准备好接收流量
+/// 检查服务状态、AI 引擎、渠道连接
+async fn ready_handler(State(state): State<WebState>) -> (axum::http::StatusCode, &'static str) {
+    let status = state.service_status.read().await;
+
+    // 检查服务状态
+    match &*status {
+        ServiceStatus::Running => {}
+        ServiceStatus::Initializing => {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready: Initializing");
+        }
+        ServiceStatus::Stopping => {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready: Stopping");
+        }
+        ServiceStatus::Stopped => {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready: Stopped");
+        }
+        ServiceStatus::Error(msg) => {
+            tracing::warn!(error = %msg, "就绪检查失败");
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready: Error");
+        }
+    }
+
+    // 检查 AI 引擎状态
+    let ai_status = state.ai_engine_status.read().await;
+    if !ai_status.is_running {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Not Ready: AI engine not running");
+    }
+
+    // 检查渠道连接状态
+    let channel_status = state.channel_status.read().await;
+    for (name, status) in channel_status.iter() {
+        if !status.connected {
+            tracing::debug!(channel = %name, "渠道未连接");
+        }
+    }
+
+    // 所有检查通过
+    (axum::http::StatusCode::OK, "Ready")
+}
+
+/// Prometheus 指标端点
+/// 返回 Prometheus 格式的监控指标
+async fn metrics_handler(State(state): State<WebState>) -> String {
+    let stats = state.service_status.read().await;
+    let message_stats = state.message_stats.read().await;
+    let ai_stats = state.ai_engine_status.read().await;
+    let channel_stats = state.channel_status.read().await;
+
+    let mut output = String::new();
+
+    // 通用指标
+    output.push_str("# HELP clawdbot_up 服务是否运行\n");
+    output.push_str("# TYPE clawdbot_up gauge\n");
+    let up = matches!(*stats, ServiceStatus::Running);
+    output.push_str(&format!("clawdbot_up {}\n", if up { 1 } else { 0 }));
+
+    // 消息统计
+    output.push_str("\n# HELP clawdbot_messages_total 总消息数\n");
+    output.push_str("# TYPE clawdbot_messages_total counter\n");
+    output.push_str(&format!("clawdbot_messages_total {}\n", message_stats.total_messages));
+
+    output.push_str("\n# HELP clawdbot_messages_today 今日消息数\n");
+    output.push_str("# TYPE clawdbot_messages_today gauge\n");
+    output.push_str(&format!("clawdbot_messages_today {}\n", message_stats.today_messages));
+
+    output.push_str("\n# HELP clawdbot_messages_success 成功处理的消息数\n");
+    output.push_str("# TYPE clawdbot_messages_success counter\n");
+    output.push_str(&format!("clawdbot_messages_success {}\n", message_stats.successful_messages));
+
+    output.push_str("\n# HELP clawdbot_messages_failed 失败的消息数\n");
+    output.push_str("# TYPE clawdbot_messages_failed counter\n");
+    output.push_str(&format!("clawdbot_messages_failed {}\n", message_stats.failed_messages));
+
+    // Token 统计
+    output.push_str("\n# HELP clawdbot_tokens_total 总 Token 数\n");
+    output.push_str("# TYPE clawdbot_tokens_total counter\n");
+    output.push_str(&format!("clawdbot_tokens_total {}\n", message_stats.total_tokens));
+
+    output.push_str("\n# HELP clawdbot_tokens_today 今日 Token 数\n");
+    output.push_str("# TYPE clawdbot_tokens_today gauge\n");
+    output.push_str(&format!("clawdbot_tokens_today {}\n", message_stats.today_tokens));
+
+    output.push_str("\n# HELP clawdbot_tokens_input 输入 Token 数\n");
+    output.push_str("# TYPE clawdbot_tokens_input counter\n");
+    output.push_str(&format!("clawdbot_tokens_input {}\n", message_stats.total_input_tokens));
+
+    output.push_str("\n# HELP clawdbot_tokens_output 输出 Token 数\n");
+    output.push_str("# TYPE clawdbot_tokens_output counter\n");
+    output.push_str(&format!("clawdbot_tokens_output {}\n", message_stats.total_output_tokens));
+
+    // 渠道统计
+    output.push_str("\n# HELP clawdbot_channel_messages 渠道消息数\n");
+    output.push_str("# TYPE clawdbot_channel_messages counter\n");
+    output.push_str(&format!("clawdbot_channel_messages{{channel=\"feishu\"}} {}\n", message_stats.feishu_messages));
+    output.push_str(&format!("clawdbot_channel_messages{{channel=\"telegram\"}} {}\n", message_stats.telegram_messages));
+    output.push_str(&format!("clawdbot_channel_messages{{channel=\"discord\"}} {}\n", message_stats.discord_messages));
+
+    // 性能统计
+    output.push_str("\n# HELP clawdbot_response_time_avg 平均响应时间（毫秒）\n");
+    output.push_str("# TYPE clawdbot_response_time_avg gauge\n");
+    output.push_str(&format!("clawdbot_response_time_avg {}\n", message_stats.avg_response_time_ms));
+
+    output.push_str("\n# HELP clawdbot_response_time_max 最大响应时间（毫秒）\n");
+    output.push_str("# TYPE clawdbot_response_time_max gauge\n");
+    output.push_str(&format!("clawdbot_response_time_max {}\n", message_stats.max_response_time_ms));
+
+    // AI 统计
+    output.push_str("\n# HELP clawdbot_ai_requests_total AI 请求总数\n");
+    output.push_str("# TYPE clawdbot_ai_requests_total counter\n");
+    output.push_str(&format!("clawdbot_ai_requests_total {}\n", message_stats.ai_requests_total));
+
+    output.push_str("\n# HELP clawdbot_ai_requests_success AI 请求成功数\n");
+    output.push_str("# TYPE clawdbot_ai_requests_success counter\n");
+    output.push_str(&format!("clawdbot_ai_requests_success {}\n", message_stats.ai_requests_success));
+
+    output.push_str("\n# HELP clawdbot_ai_requests_failed AI 请求失败数\n");
+    output.push_str("# TYPE clawdbot_ai_requests_failed counter\n");
+    output.push_str(&format!("clawdbot_ai_requests_failed {}\n", message_stats.ai_requests_failed));
+
+    // 会话统计
+    output.push_str("\n# HELP clawdbot_active_sessions 当前活跃会话数\n");
+    output.push_str("# TYPE clawdbot_active_sessions gauge\n");
+    output.push_str(&format!("clawdbot_active_sessions {}\n", message_stats.active_sessions));
+
+    // 渠道连接状态
+    output.push_str("\n# HELP clawdbot_channel_connected 渠道连接状态\n");
+    output.push_str("# TYPE clawdbot_channel_connected gauge\n");
+    for (name, status) in channel_stats.iter() {
+        output.push_str(&format!("clawdbot_channel_connected{{channel=\"{}\"}} {}\n",
+            name, if status.connected { 1 } else { 0 }));
+    }
+
+    // AI 引擎状态
+    output.push_str("\n# HELP clawdbot_ai_engine_running AI 引擎运行状态\n");
+    output.push_str("# TYPE clawdbot_ai_engine_running gauge\n");
+    output.push_str(&format!("clawdbot_ai_engine_running {}\n",
+        if ai_stats.is_running { 1 } else { 0 }));
+
+    output
+}
+
+/// 获取详细服务状态
+async fn api_status_handler(State(state): State<WebState>) -> Json<JsonValue> {
+    let service_status = state.service_status.read().await;
+    let ai_status = state.ai_engine_status.read().await;
+    let channel_status = state.channel_status.read().await;
+
+    // 构建渠道状态的 HashMap
+    let mut channels_map = serde_json::Map::new();
+    for (name, status) in &*channel_status {
+        let mut channel_obj = serde_json::Map::new();
+        channel_obj.insert("connected".to_string(), json!(status.connected));
+        channel_obj.insert("last_connected".to_string(), json!(status.last_connected));
+        channel_obj.insert("last_error".to_string(), json!(status.last_error));
+        channel_obj.insert("message_count".to_string(), json!(status.message_count));
+        channels_map.insert(name.clone(), json!(channel_obj));
+    }
+
+    Json(json!({
+        "service": {
+            "status": format!("{:?}", *service_status),
+        },
+        "ai_engine": {
+            "is_running": ai_status.is_running,
+            "active_providers": ai_status.active_providers,
+            "default_provider": ai_status.default_provider,
+            "last_error": ai_status.last_error,
+        },
+        "channels": channels_map,
+    }))
 }
 
 // 发送测试消息 - 调用真实 MiniMax AI
@@ -466,8 +1133,55 @@ impl WebServer {
                 conversation_history: Arc::new(RwLock::new(Vec::new())),
                 config: Arc::new(tokio::sync::Mutex::new(None)),
                 audit_service: Arc::new(RwLock::new(None)),
+                service_status: Arc::new(RwLock::new(ServiceStatus::Initializing)),
+                ai_engine_status: Arc::new(RwLock::new(AIEngineStatus::default())),
+                channel_status: Arc::new(RwLock::new(HashMap::new())),
+                auth_config: Arc::new(RwLock::new(AuthConfig::default())),
+                ws_manager: Arc::new(WebSocketManager::new()),
             },
         }
+    }
+
+    /// 配置认证
+    pub fn configure_auth(&self, username: &str, password: &str) {
+        let mut auth_config = futures::executor::block_on(self.state.auth_config.write());
+        auth_config.enabled = true;
+        auth_config.username = username.to_string();
+        auth_config.password = password.to_string();
+        tracing::info!(username = username, "认证已启用");
+    }
+
+    /// 禁用认证
+    pub fn disable_auth(&self) {
+        let mut auth_config = futures::executor::block_on(self.state.auth_config.write());
+        auth_config.enabled = false;
+        tracing::info!("认证已禁用");
+    }
+
+    /// 设置服务状态
+    pub fn set_service_status(&self, status: ServiceStatus) {
+        tracing::info!(status = ?status, "服务状态即将更新");
+        let mut guard = futures::executor::block_on(self.state.service_status.write());
+        *guard = status;
+        // 使用 guard 的值来日志，避免移动后使用
+        tracing::info!(status = ?*guard, "服务状态已更新");
+    }
+
+    /// 设置 AI 引擎状态
+    pub fn set_ai_engine_status(&self, status: AIEngineStatus) {
+        tracing::info!(is_running = status.is_running, "AI 引擎状态即将更新");
+        let mut guard = futures::executor::block_on(self.state.ai_engine_status.write());
+        *guard = status;
+        // 使用 guard 的值来日志
+        tracing::info!(is_running = guard.is_running, "AI 引擎状态已更新");
+    }
+
+    /// 更新渠道连接状态
+    pub fn update_channel_status(&self, channel: &str, status: ChannelConnectionStatus) {
+        let connected = status.connected;
+        tracing::info!(channel = channel, connected = connected, "渠道状态已更新");
+        let mut guard = futures::executor::block_on(self.state.channel_status.write());
+        guard.insert(channel.to_string(), status);
     }
 
     /// 设置审计服务
@@ -483,7 +1197,23 @@ impl WebServer {
 
     /// 创建 Axum 路由
     pub fn create_router(&self) -> Router {
-        Router::new()
+        // 创建公共路由（不需要认证）
+        let public_routes = Router::new()
+            // 健康检查端点（无认证）
+            .route("/health", get(health_handler))
+            .route("/ready", get(ready_handler))
+            .route("/metrics", get(metrics_handler))
+            // WebSocket 端点（无认证，方便前端连接）
+            .route("/ws", get(ws_handler))
+            // WebSocket 状态
+            .route("/api/ws/status", get(ws_status_handler))
+            .with_state(self.state.clone());
+
+        // 创建受保护的路由（需要认证）
+        // 创建认证中间件状态
+        let auth_middleware_state = AuthMiddlewareState::new(self.state.auth_config.clone());
+
+        let protected_routes = Router::new()
             // 静态页面
             .route("/", get(index_handler))
             .route("/debug", get(debug_handler))
@@ -495,6 +1225,8 @@ impl WebServer {
             .route("/api/debug/history", get(api_conversation_history))
             .route("/api/debug/stats", get(api_stats))
             .route("/api/debug/clear", post(api_clear_history))
+            // API - 服务状态
+            .route("/api/status", get(api_status_handler))
             // API - 配置管理
             .route("/api/config", get(api_get_config))
             .route("/api/config", put(api_update_config))
@@ -509,10 +1241,22 @@ impl WebServer {
             .route("/api/audit/logs", get(api_audit_logs))
             .route("/api/audit/export", get(api_audit_export))
             .route("/api/audit/cleanup", post(api_audit_cleanup))
+            // API - 认证管理
+            .route("/api/auth/status", get(auth_status_handler))
+            .route("/api/auth/logout", post(logout_handler))
             // 静态资源
             .route("/static/style.css", get(static_style_css))
             .route("/static/app.js", get(static_app_js))
-            .with_state(self.state.clone())
+            // 添加认证中间件（带状态）
+            .layer(axum::middleware::from_fn_with_state(
+                auth_middleware_state,
+                auth_middleware,
+            ))
+            // 添加主状态
+            .with_state(self.state.clone());
+
+        // 合并路由
+        public_routes.merge(protected_routes)
     }
 
     /// 启动服务器
@@ -558,7 +1302,11 @@ const HTML_INDEX: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/audit">安全审计</a></li>
         </ul>
+        <div class="sidebar-footer">
+            <button id="logoutBtn" class="logout-btn">退出登录</button>
+        </div>
     </nav>
     <main>
         <h1>欢迎使用 Clawdbot</h1>
@@ -587,7 +1335,11 @@ const HTML_DEBUG: &str = r#"
             <li><a href="/debug" class="active">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/audit">安全审计</a></li>
         </ul>
+        <div class="sidebar-footer">
+            <button id="logoutBtn" class="logout-btn">退出登录</button>
+        </div>
     </nav>
     <main>
         <h1>调试监控</h1>
@@ -664,7 +1416,11 @@ const HTML_CONFIG: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config" class="active">配置管理</a></li>
             <li><a href="/operations">运营数据</a></li>
+            <li><a href="/audit">安全审计</a></li>
         </ul>
+        <div class="sidebar-footer">
+            <button id="logoutBtn" class="logout-btn">退出登录</button>
+        </div>
     </nav>
     <main>
         <h1>配置管理</h1>
@@ -709,7 +1465,11 @@ const HTML_OPERATIONS: &str = r#"
             <li><a href="/debug">调试监控</a></li>
             <li><a href="/config">配置管理</a></li>
             <li><a href="/operations" class="active">运营数据</a></li>
+            <li><a href="/audit">安全审计</a></li>
         </ul>
+        <div class="sidebar-footer">
+            <button id="logoutBtn" class="logout-btn">退出登录</button>
+        </div>
     </nav>
     <main>
         <h1>运营数据</h1>
@@ -772,6 +1532,9 @@ const HTML_AUDIT: &str = r#"
             <li><a href="/operations">运营数据</a></li>
             <li><a href="/audit" class="active">安全审计</a></li>
         </ul>
+        <div class="sidebar-footer">
+            <button id="logoutBtn" class="logout-btn">退出登录</button>
+        </div>
     </nav>
     <main>
         <h1>安全审计</h1>
@@ -929,6 +1692,13 @@ button:hover { background: #0056b3; }
 #sendResult { margin-top: 15px; padding: 10px; border-radius: 4px; }
 #sendResult.success { background: #d4edda; color: #155724; }
 #sendResult.error { background: #f8d7da; color: #721c24; }
+
+/* 侧边栏底部 */
+.sidebar-footer { margin-top: auto; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); }
+
+/* 退出登录按钮 */
+.logout-btn { width: 100%; background: #dc3545; color: #fff; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+.logout-btn:hover { background: #c82333; }
 "#;
 
 // JavaScript
@@ -1007,4 +1777,19 @@ async function loadChannels() {
     const data = await api('/api/config/channels');
     document.getElementById('channelsList').innerHTML = data.channels.map(c => '<div class="channel-item"><strong>' + c + '</strong> ' + (data.enabled.includes(c) ? '✓ 已启用' : '✗ 已禁用') + '</div>').join('');
 }
+
+// 退出登录按钮点击事件
+document.getElementById('logoutBtn')?.addEventListener('click', async () => {
+    if (confirm('确定要退出登录吗？')) {
+        try {
+            await fetch('/api/auth/logout', { method: 'POST' });
+            // 清除认证信息并刷新页面或跳转到首页
+            sessionStorage.removeItem('auth');
+            window.location.reload();
+        } catch (e) {
+            console.error('退出失败:', e);
+            window.location.reload();
+        }
+    }
+});
 "#;
