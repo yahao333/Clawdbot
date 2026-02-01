@@ -264,9 +264,10 @@ impl DefaultMessageHandler {
     /// 核心消息处理逻辑（由队列消费者调用）
     pub async fn process_message(ctx: HandlerContext, message: InboundMessage) {
         let message_id = message.id.clone();
+        let start_time = std::time::Instant::now();
         debug!(message_id = %message_id, "开始从队列消费并处理消息");
 
-        // 获取会话
+        // 获取会话（需要先路由）
         let route_match = match ctx.router.route(&message).await {
             Ok(r) => r,
             Err(e) => {
@@ -275,8 +276,10 @@ impl DefaultMessageHandler {
             }
         };
 
-        // 会话去重检查
+        // 创建会话
         let session = ctx.session_manager.get_or_create_session(&message, &route_match.agent_id).await;
+
+        // 会话去重检查
         if ctx.session_manager.is_message_processed(&message_id, &session.id).await {
             info!(message_id = %message_id, "消息已处理过，跳过");
             return;
@@ -288,6 +291,9 @@ impl DefaultMessageHandler {
             session_id = %session.id,
             "消息路由成功"
         );
+
+        // 记录入站消息审计（包含会话和路由信息）
+        Self::log_audit(&ctx, &message, true, None, Some(&session.id), Some(&route_match.agent_id), None, None, 0, 0, 0, route_match.confidence).await;
 
         // 提取消息内容用于历史记录
         let message_content = message.content.text.clone()
@@ -315,6 +321,9 @@ impl DefaultMessageHandler {
             ctx.session_manager.add_message_to_session(&session.id, "assistant", text).await;
         }
 
+        // 计算处理耗时
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
         // 6. 发送响应
         debug!("准备发送响应");
         let send_result = if let Some(ref resp_content) = response_text {
@@ -330,6 +339,22 @@ impl DefaultMessageHandler {
             match ctx.sender.send(outbound).await {
                 Ok(msg_id) => {
                     info!(response_id = %msg_id, "响应发送成功");
+                    // 记录出站消息审计（传入 AI 回复内容）
+                    // 注意：Token 使用信息需要后续完善 AI 引擎返回类型
+                    Self::log_audit(
+                        &ctx,
+                        &message,
+                        false,
+                        Some(resp_content.as_str()),
+                        Some(&session.id),
+                        Some(&route_match.agent_id),
+                        None,
+                        None,
+                        0,
+                        0,
+                        duration_ms,
+                        route_match.confidence,
+                    ).await;
                     true
                 },
                 Err(e) => {
@@ -398,6 +423,99 @@ impl DefaultMessageHandler {
         }
 
         info!(message_id = %message_id, session_id = %session.id, "消息处理完成");
+    }
+
+    /// 记录审计日志
+    ///
+    /// # 参数说明
+    /// * `ctx` - 处理上下文
+    /// * `message` - 入站消息
+    /// * `is_inbound` - 是否为入站消息
+    /// * `response_content` - 可选的 AI 回复内容（用于出站消息审计）
+    /// * `session_id` - 会话 ID
+    /// * `agent_id` - Agent ID
+    /// * `ai_provider` - AI 提供商名称
+    /// * `ai_model` - AI 模型名称
+    /// * `prompt_tokens` - 输入 Token 数
+    /// * `completion_tokens` - 输出 Token 数
+    /// * `duration_ms` - 处理耗时（毫秒）
+    /// * `routing_confidence` - 路由置信度
+    async fn log_audit(
+        ctx: &HandlerContext,
+        message: &InboundMessage,
+        is_inbound: bool,
+        response_content: Option<&str>,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        ai_provider: Option<&str>,
+        ai_model: Option<&str>,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        duration_ms: u64,
+        routing_confidence: f64,
+    ) {
+        // 获取审计服务
+        let audit_service = match ctx.web_state() {
+            Some(ws) => {
+                let guard = futures::executor::block_on(ws.audit_service.read());
+                guard.clone()
+            }
+            None => None,
+        };
+
+        // 如果没有审计服务，跳过
+        let audit_service = match audit_service {
+            Some(svc) => svc,
+            None => return,
+        };
+
+        // 确定要记录的内容：入站消息内容 或 AI 回复内容
+        let (content, message_type) = if let Some(response) = response_content {
+            // 出站消息审计
+            tracing::debug!(is_inbound = false, response_content = %response, "审计：记录出站消息");
+            (response.to_string(), "ai_response".to_string())
+        } else {
+            // 入站消息审计
+            let content = message.content.text.clone()
+                .or(message.content.rich_text.as_ref().map(|r| r.content.clone()))
+                .unwrap_or_default();
+
+            tracing::debug!(is_inbound = true, inbound_content = %content, "审计：记录入站消息");
+
+            let message_type = if message.content.text.is_some() {
+                "text"
+            } else if message.content.rich_text.is_some() {
+                "rich_text"
+            } else if !message.content.attachments.is_empty() {
+                "attachment"
+            } else {
+                "unknown"
+            }.to_string();
+
+            (content, message_type)
+        };
+
+        let audit_context = crate::security::types::AuditContext {
+            message_id: message.id.clone(),
+            channel: message.channel.clone(),
+            user_id: message.sender.id.clone(),
+            target_id: message.target.id.clone(),
+            message_type,
+            client_ip: None,
+            session_id: session_id.map(|s| s.to_string()),
+            agent_id: agent_id.map(|s| s.to_string()),
+            ai_provider: ai_provider.map(|s| s.to_string()),
+            ai_model: ai_model.map(|s| s.to_string()),
+            prompt_tokens: Some(prompt_tokens),
+            completion_tokens: Some(completion_tokens),
+            duration_ms: Some(duration_ms),
+            routing_confidence: Some(routing_confidence),
+            is_safe: true,
+            detected_words: vec![],
+        };
+
+        // 记录审计日志（忽略错误）
+        let _ = audit_service.log_message(&audit_context, &content, is_inbound).await;
     }
 }
 

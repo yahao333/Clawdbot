@@ -2557,14 +2557,37 @@ const HTML_AUDIT: &str = r#"
         .level-warning { background: #fff3cd; color: #856404; }
         .level-error { background: #f8d7da; color: #721c24; }
         .level-critical { background: #dc3545; color: #fff; }
-        .log-table { width: 100%; border-collapse: collapse; }
-        .log-table th, .log-table td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
-        .log-table th { background: #f8f9fa; font-weight: 600; }
+        .log-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        .log-table th, .log-table td { padding: 8px; text-align: left; border-bottom: 1px solid #eee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .log-table th { background: #f8f9fa; font-weight: 600; font-size: 12px; }
         .log-table tr:hover { background: #f8f9fa; }
-        .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .log-table tr.expanded { background: #fffbe6; }
+        .filter-bar { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
         .filter-bar select, .filter-bar input { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
         .export-btn { background: #28a745; }
         .cleanup-btn { background: #dc3545; }
+        /* 字段配置面板 */
+        .field-config { background: #f8f9fa; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #e9ecef; }
+        .field-config h4 { margin: 0 0 10px 0; font-size: 13px; color: #555; }
+        .field-toggles { display: flex; flex-wrap: wrap; gap: 8px; }
+        .field-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; padding: 4px 8px; background: #fff; border: 1px solid #ddd; border-radius: 4px; transition: all 0.2s; }
+        .field-toggle:hover { border-color: #007bff; }
+        .field-toggle input { cursor: pointer; }
+        .field-toggle.hidden { opacity: 0.5; background: #f0f0f0; }
+        /* 展开详情行 */
+        .detail-row { display: none; background: #fafafa; }
+        .detail-row.show { display: table-row; }
+        .detail-cell { padding: 15px !important; background: #fafafa; }
+        .detail-content { font-size: 12px; line-height: 1.6; }
+        .detail-content strong { color: #333; }
+        .detail-row:hover { background: #fafafa; }
+        /* 元数据标签 */
+        .meta-tag { display: inline-block; padding: 2px 6px; background: #e9ecef; border-radius: 3px; font-size: 11px; margin: 2px; }
+        .meta-tag-session { background: #cce5ff; color: #004085; }
+        .meta-tag-agent { background: #d4edda; color: #155724; }
+        .meta-tag-ai { background: #fff3cd; color: #856404; }
+        .meta-tag-token { background: #f8d7da; color: #721c24; }
+        .meta-tag-time { background: #d1ecf1; color: #0c5460; }
     </style>
 </head>
 <body>
@@ -2611,6 +2634,7 @@ const HTML_AUDIT: &str = r#"
                 审计日志
                 <button onclick="exportLogs()" class="btn-small export-btn">导出 JSON</button>
                 <button onclick="cleanupLogs()" class="btn-small cleanup-btn">清理过期</button>
+                <button onclick="resetFieldConfig()" class="btn-small" style="background: #6c757d;">重置配置</button>
             </h2>
             <div class="filter-bar">
                 <select id="filterLevel">
@@ -2625,11 +2649,97 @@ const HTML_AUDIT: &str = r#"
                 <input type="text" id="filterUser" placeholder="用户筛选">
                 <button onclick="loadLogs()">查询</button>
             </div>
+            <!-- 字段配置面板 -->
+            <div class="field-config">
+                <h4>显示字段配置（点击切换）</h4>
+                <div class="field-toggles" id="fieldToggles"></div>
+            </div>
             <div id="logsTable"></div>
         </section>
     </main>
     <script src="/static/app.js"></script>
     <script>
+// 字段配置 - 可显示的字段及其标签
+const AUDIT_FIELDS = {
+    timestamp: { label: '时间', default: true },
+    level: { label: '级别', default: true },
+    category: { label: '类别', default: false },
+    channel: { label: '渠道', default: true },
+    user_id: { label: '用户', default: true },
+    target_id: { label: '目标', default: false },
+    event_type: { label: '事件类型', default: false },
+    session_id: { label: '会话ID', default: true },
+    agent_id: { label: 'Agent', default: true },
+    ai_provider: { label: 'AI提供商', default: true },
+    ai_model: { label: 'AI模型', default: true },
+    prompt_tokens: { label: '输入Token', default: true },
+    completion_tokens: { label: '输出Token', default: true },
+    duration_ms: { label: '耗时', default: true },
+    routing_confidence: { label: '路由置信度', default: true },
+    content: { label: '内容', default: true },
+    is_safe: { label: '安全', default: false },
+    detected_words: { label: '敏感词', default: true }
+};
+
+// 当前字段配置（从localStorage加载或使用默认值）
+let fieldConfig = {};
+
+// 初始化字段配置
+function initFieldConfig() {
+    const saved = localStorage.getItem('auditFieldConfig');
+    if (saved) {
+        try {
+            fieldConfig = JSON.parse(saved);
+        } catch (e) {
+            fieldConfig = {};
+        }
+    }
+    // 确保所有字段都有配置值
+    for (const key in AUDIT_FIELDS) {
+        if (fieldConfig[key] === undefined) {
+            fieldConfig[key] = AUDIT_FIELDS[key].default;
+        }
+    }
+    renderFieldToggles();
+}
+
+// 渲染字段切换按钮
+function renderFieldToggles() {
+    const container = document.getElementById('fieldToggles');
+    if (!container) return;
+
+    let html = '';
+    for (const key in AUDIT_FIELDS) {
+        const field = AUDIT_FIELDS[key];
+        const checked = fieldConfig[key] ? '' : 'class="hidden"';
+        html += `<label class="field-toggle" ${checked} title="${field.label}">
+            <input type="checkbox" ${fieldConfig[key] ? 'checked' : ''} onchange="toggleField('${key}')">
+            ${field.label}
+        </label>`;
+    }
+    container.innerHTML = html;
+}
+
+// 切换字段显示/隐藏
+function toggleField(key) {
+    fieldConfig[key] = !fieldConfig[key];
+    localStorage.setItem('auditFieldConfig', JSON.stringify(fieldConfig));
+    renderFieldToggles();
+    loadLogs();
+}
+
+// 重置字段配置
+function resetFieldConfig() {
+    localStorage.removeItem('auditFieldConfig');
+    initFieldConfig();
+    loadLogs();
+}
+
+// 获取当前显示的字段列表
+function getVisibleFields() {
+    return Object.keys(AUDIT_FIELDS).filter(key => fieldConfig[key]);
+}
+
 // 加载审计统计
 async function loadAuditStats() {
     const result = await api('/api/audit/stats');
@@ -2639,6 +2749,56 @@ async function loadAuditStats() {
         document.getElementById('warningEvents').textContent = result.stats.warning_events || 0;
         document.getElementById('errorEvents').textContent = result.stats.error_events || 0;
     }
+}
+
+// 格式化元数据显示
+function formatMetadata(log) {
+    let html = '<div class="detail-content">';
+
+    // 安全信息
+    html += '<div style="margin-bottom: 10px;">';
+    html += '<span class="meta-tag ' + (log.is_safe ? 'meta-tag-time' : 'meta-tag-token') + '">';
+    html += '安全: ' + (log.is_safe ? '是' : '否') + '</span>';
+    if (log.detected_words && log.detected_words.length > 0) {
+        html += ' <span class="meta-tag meta-tag-token">敏感词: ' + log.detected_words.join(', ') + '</span>';
+    }
+    html += '</div>';
+
+    // AI 信息
+    html += '<div style="margin-bottom: 10px;">';
+    if (log.ai_provider) {
+        html += '<span class="meta-tag meta-tag-ai">提供商: ' + log.ai_provider + '</span>';
+    }
+    if (log.ai_model) {
+        html += '<span class="meta-tag meta-tag-ai">模型: ' + log.ai_model + '</span>';
+    }
+    if (log.prompt_tokens) {
+        html += '<span class="meta-tag meta-tag-token">输入: ' + log.prompt_tokens + '</span>';
+    }
+    if (log.completion_tokens) {
+        html += '<span class="meta-tag meta-tag-token">输出: ' + log.completion_tokens + '</span>';
+    }
+    if (log.duration_ms) {
+        html += '<span class="meta-tag meta-tag-time">' + log.duration_ms + 'ms</span>';
+    }
+    if (log.routing_confidence !== null && log.routing_confidence !== undefined) {
+        html += '<span class="meta-tag meta-tag-session">置信度: ' + (log.routing_confidence * 100).toFixed(1) + '%</span>';
+    }
+    html += '</div>';
+
+    // 完整内容
+    html += '<div><strong>内容:</strong><br>' + escapeHtml(log.content || '') + '</div>';
+
+    html += '</div>';
+    return html;
+}
+
+// HTML转义
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML.replace(/\n/g, '<br>');
 }
 
 // 加载审计日志
@@ -2656,21 +2816,62 @@ async function loadLogs() {
     const container = document.getElementById('logsTable');
 
     if (result.success && result.logs.length > 0) {
-        let html = '<table class="log-table"><thead><tr><th>时间</th><th>级别</th><th>渠道</th><th>用户</th><th>内容</th></tr></thead><tbody>';
-        result.logs.forEach(log => {
-            const levelClass = 'level-' + (log.level || 'info').toLowerCase();
-            html += '<tr>';
-            html += '<td>' + (log.timestamp || '') + '</td>';
-            html += '<td><span class="audit-level ' + levelClass + '">' + (log.level || 'INFO') + '</span></td>';
-            html += '<td>' + (log.channel || '') + '</td>';
-            html += '<td>' + (log.user_id || log.channel || '') + '</td>';
-            html += '<td>' + (log.content || '').substring(0, 100) + '</td>';
-            html += '</tr>';
+        const visibleFields = getVisibleFields();
+
+        // 生成表头
+        let thead = '<thead><tr>';
+        visibleFields.forEach(field => {
+            thead += '<th>' + AUDIT_FIELDS[field].label + '</th>';
         });
+        thead += '<th style="width:50px">详情</th></tr></thead>';
+
+        // 生成表格
+        let html = '<table class="log-table" id="auditTable">' + thead + '<tbody>';
+
+        result.logs.forEach((log, index) => {
+            html += '<tr onclick="toggleDetail(' + index + ')" style="cursor:pointer">';
+            visibleFields.forEach(field => {
+                let value = log[field] !== undefined ? log[field] : '';
+
+                // 特殊格式化
+                if (field === 'level' && value) {
+                    const levelClass = 'level-' + value.toLowerCase();
+                    value = '<span class="audit-level ' + levelClass + '">' + value + '</span>';
+                } else if (field === 'routing_confidence' && value !== null && value !== undefined) {
+                    value = (value * 100).toFixed(1) + '%';
+                } else if (field === 'is_safe' && value !== undefined) {
+                    value = value ? '安全' : '<span style="color:#dc3545">警告</span>';
+                } else if (field === 'detected_words' && Array.isArray(value) && value.length > 0) {
+                    value = value.join(', ');
+                } else if (field === 'content' && value && value.length > 100) {
+                    value = value.substring(0, 100) + '...';
+                }
+
+                html += '<td>' + value + '</td>';
+            });
+            html += '<td><span id="detailIcon' + index + '">▶</span></td>';
+            html += '</tr>';
+
+            // 详情行
+            html += '<tr class="detail-row" id="detailRow' + index + '"><td colspan="' + (visibleFields.length + 1) + '" class="detail-cell">';
+            html += formatMetadata(log);
+            html += '</td></tr>';
+        });
+
         html += '</tbody></table>';
         container.innerHTML = html;
     } else {
         container.innerHTML = '<p>暂无审计日志</p>';
+    }
+}
+
+// 切换详情显示
+function toggleDetail(index) {
+    const row = document.getElementById('detailRow' + index);
+    const icon = document.getElementById('detailIcon' + index);
+    if (row && icon) {
+        row.classList.toggle('show');
+        icon.textContent = row.classList.contains('show') ? '▼' : '▶';
     }
 }
 
@@ -2695,6 +2896,7 @@ async function cleanupLogs() {
 
 // 页面加载时初始化
 if (document.getElementById('logsTable')) {
+    initFieldConfig();
     loadAuditStats();
     loadLogs();
 }

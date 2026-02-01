@@ -32,18 +32,22 @@ impl AuditStorage {
     ///
     /// 初始化 SQLite 连接和文件存储
     pub async fn new() -> Result<Self, sqlx::Error> {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("clawdbot");
+        // 使用当前工作目录下的 audit 目录
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let data_dir = current_dir.join("data/audit");
 
         // 确保目录存在
-        tokio::fs::create_dir_all(&data_dir).await.ok();
+        if let Err(e) = tokio::fs::create_dir_all(&data_dir).await {
+            tracing::error!(error = %e, path = %data_dir.display(), "创建审计目录失败");
+        }
 
         let db_path = data_dir.join("audit.db");
         let file_path = data_dir.join("audit_logs.jsonl");
 
+        tracing::info!(db_path = %db_path.display(), "尝试连接审计数据库");
+
         // 创建 SQLite 连接池
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display())).await?;
+        let pool = sqlx::SqlitePool::connect(&db_path.display().to_string()).await?;
 
         // 初始化数据库表
         Self::init_schema(&pool).await?;
@@ -194,14 +198,16 @@ impl AuditStorage {
     /// * `start_time` - 开始时间
     /// * `end_time` - 结束时间
     /// * `level` - 级别过滤（可选）
+    /// * `limit` - 最大返回数量
     ///
     /// # 返回值
-    /// 匹配的审计事件列表
+    /// 匹配的审计事件列表（按时间倒序）
     pub async fn query(
         &self,
         start_time: SystemTime,
         end_time: SystemTime,
         level: Option<AuditLevel>,
+        limit: Option<u32>,
     ) -> Result<Vec<AuditEvent>, sqlx::Error> {
         let start_ts = start_time
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -213,7 +219,9 @@ impl AuditStorage {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(i64::MAX);
 
-        // 构建查询
+        let limit = limit.unwrap_or(100);
+
+        // 构建查询（倒序排列，最近的在前）
         let query_str = format!(
             r#"SELECT id, timestamp, level, category, event_type,
                     message_id, channel, user_id, target_id, message_type,
@@ -223,7 +231,8 @@ impl AuditStorage {
 
         // 根据是否需要级别过滤选择查询
         let rows = if let Some(lvl) = &level {
-            let query_with_level = format!("{} AND level = ?", query_str);
+            // SQLite 不支持 order_by 方法，直接在 SQL 中添加 ORDER BY
+            let query_with_level = format!("{} AND level = ? ORDER BY timestamp DESC LIMIT {}", query_str, limit);
             sqlx::query(&query_with_level)
                 .bind(start_ts)
                 .bind(end_ts)
@@ -231,7 +240,8 @@ impl AuditStorage {
                 .fetch_all(&*self.pool)
                 .await?
         } else {
-            sqlx::query(&query_str)
+            let query_no_level = format!("{} ORDER BY timestamp DESC LIMIT {}", query_str, limit);
+            sqlx::query(&query_no_level)
                 .bind(start_ts)
                 .bind(end_ts)
                 .fetch_all(&*self.pool)
@@ -257,6 +267,16 @@ impl AuditStorage {
                     target_id: row.try_get(8)?,
                     message_type: row.try_get(9)?,
                     client_ip: None,
+                    session_id: None,
+                    agent_id: None,
+                    ai_provider: None,
+                    ai_model: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    duration_ms: None,
+                    routing_confidence: None,
+                    is_safe: true,
+                    detected_words: vec![],
                 },
                 content: row.try_get(10)?,
                 original_content: None,

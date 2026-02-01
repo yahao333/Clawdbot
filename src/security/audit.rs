@@ -152,6 +152,16 @@ impl AuditService {
                 "is_safe": is_safe,
                 "detected_words": detected_words,
                 "is_inbound": is_inbound,
+                // 额外上下文信息
+                "session_id": context.session_id,
+                "agent_id": context.agent_id,
+                "ai_provider": context.ai_provider,
+                "ai_model": context.ai_model,
+                "prompt_tokens": context.prompt_tokens,
+                "completion_tokens": context.completion_tokens,
+                "total_tokens": context.prompt_tokens.map(|p| p + context.completion_tokens.unwrap_or(0)),
+                "duration_ms": context.duration_ms,
+                "routing_confidence": context.routing_confidence,
             }),
         };
 
@@ -313,9 +323,9 @@ impl AuditService {
         end_time: SystemTime,
         level: Option<AuditLevel>,
     ) -> Result<String> {
-        let events = self.storage.query(start_time, end_time, level).await?;
+        let events = self.storage.query(start_time, end_time, level, None).await?;
 
-        // 序列化时脱敏
+        // 序列化时脱敏，包含所有元数据字段
         let masked_events: Vec<serde_json::Value> = events.iter()
             .map(|e| {
                 serde_json::json!({
@@ -324,9 +334,27 @@ impl AuditService {
                     "level": format!("{:?}", e.level),
                     "category": format!("{:?}", e.category),
                     "event_type": e.event_type,
+                    // 上下文信息
+                    "message_id": e.context.message_id,
                     "channel": e.context.channel,
                     "user_id": e.context.user_id,
+                    "target_id": e.context.target_id,
+                    "message_type": e.context.message_type,
+                    // 会话和AI信息
+                    "session_id": e.context.session_id,
+                    "agent_id": e.context.agent_id,
+                    "ai_provider": e.context.ai_provider,
+                    "ai_model": e.context.ai_model,
+                    "prompt_tokens": e.context.prompt_tokens,
+                    "completion_tokens": e.context.completion_tokens,
+                    "duration_ms": e.context.duration_ms,
+                    "routing_confidence": e.context.routing_confidence,
+                    // 安全信息
+                    "is_safe": e.context.is_safe,
+                    "detected_words": e.context.detected_words,
+                    // 内容
                     "content": e.content,
+                    // 完整元数据
                     "metadata": e.metadata,
                 })
             })

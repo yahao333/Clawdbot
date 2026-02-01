@@ -92,6 +92,34 @@ pub struct AuditContext {
     pub message_type: String,
     /// 客户端 IP（用于网络请求审计）
     pub client_ip: Option<String>,
+    /// 会话 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Agent ID（用于标识处理此消息的 AI Agent）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// AI 提供商（如：deepseek, openai, minimax）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_provider: Option<String>,
+    /// 使用的 AI 模型
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_model: Option<String>,
+    /// 输入 Token 数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    /// 输出 Token 数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    /// 处理耗时（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 路由置信度
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_confidence: Option<f64>,
+    /// 消息是否安全（通过敏感词检测）
+    pub is_safe: bool,
+    /// 检测到的敏感词列表
+    pub detected_words: Vec<String>,
 }
 
 impl AuditContext {
@@ -110,6 +138,16 @@ impl AuditContext {
             target_id: target_id.to_string(),
             message_type: message_type.to_string(),
             client_ip: None,
+            session_id: None,
+            agent_id: None,
+            ai_provider: None,
+            ai_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            duration_ms: None,
+            routing_confidence: None,
+            is_safe: true,
+            detected_words: vec![],
         }
     }
 
@@ -133,6 +171,16 @@ impl AuditContext {
             target_id: message.target.id.clone(),
             message_type,
             client_ip: None,
+            session_id: None,
+            agent_id: None,
+            ai_provider: None,
+            ai_model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            duration_ms: None,
+            routing_confidence: None,
+            is_safe: true,
+            detected_words: vec![],
         }
     }
 }
