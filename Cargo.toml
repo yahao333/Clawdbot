@@ -78,10 +78,12 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 # dirs：获取系统目录（用于存储审计日志）
 dirs = "5"
+
+# -------------------- Sandbox 模块依赖 --------------------
+# dashmap：高性能并发 HashMap（用于用户沙箱缓存）
+dashmap = "6"
 # lazy_static：静态变量延迟初始化
 lazy_static = "1.4"
-# dashmap：高性能并发 HashMap
-dashmap = "6.0"
 # tokio-stream：异步流处理
 tokio-stream = "0.1"
 # futures：异步编程工具

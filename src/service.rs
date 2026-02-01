@@ -28,9 +28,13 @@ pub enum ServiceStatus {
 /// 服务配置
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
+    /// 配置文件路径
     pub config_path: String,
+    /// 是否启用详细日志
     pub verbose: bool,
+    /// HTTP 端口
     pub port: u16,
+    /// 健康检查间隔
     pub health_check_interval: Duration,
 }
 

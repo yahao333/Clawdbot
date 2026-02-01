@@ -21,3 +21,8 @@ pub mod service;
 pub mod web;
 /// 安全审计模块
 pub mod security;
+
+/// Sandbox 沙箱模块
+///
+/// 提供安全的文件操作沙箱功能，用户只能访问其专属目录下的文件
+pub mod sandbox;
