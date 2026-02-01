@@ -20,12 +20,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{AiProvider, ChatMessage, ChatRequest, ChatResponse, ModelConfig, ProviderRegistry, TokenUsage};
 use crate::infra::error::Result;
-
-/// DeepSeek API 基础 URL
-const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
-
-/// DeepSeek 默认模型
-const DEFAULT_MODEL: &str = "deepseek-chat";
+use crate::ai::constants::{
+    DEEPSEEK_BASE_URL, DEEPSEEK_DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
+    PROVIDER_DEEPSEEK,
+};
 
 /// DeepSeek Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,9 +46,9 @@ impl Default for DeepSeekConfig {
         Self {
             api_key: String::new(),
             base_url: None,
-            model: Some(DEFAULT_MODEL.to_string()),
-            temperature: Some(0.7),
-            max_tokens: Some(4096),
+            model: Some(DEEPSEEK_DEFAULT_MODEL.to_string()),
+            temperature: Some(DEFAULT_TEMPERATURE),
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
         }
     }
 }
@@ -142,7 +141,7 @@ impl DeepSeekProvider {
     /// 创建的 Provider
     pub fn new(config: DeepSeekConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("创建 HTTP 客户端失败");
 
@@ -160,7 +159,8 @@ impl DeepSeekProvider {
 
     /// 获取模型名称
     fn get_model(&self) -> String {
-        self.config.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        self.config.model.clone()
+            .unwrap_or_else(|| DEEPSEEK_DEFAULT_MODEL.to_string())
     }
 }
 
@@ -168,7 +168,7 @@ impl DeepSeekProvider {
 impl AiProvider for DeepSeekProvider {
     /// 获取 Provider 名称
     fn name(&self) -> &str {
-        "deepseek"
+        PROVIDER_DEEPSEEK
     }
 
     /// 发送聊天请求

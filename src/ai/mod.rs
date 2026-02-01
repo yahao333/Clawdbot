@@ -4,6 +4,7 @@
 
 pub mod provider;
 pub mod engine;
+pub mod constants;
 
 // 暂时移除未实现的模块
 // pub mod embeddings;

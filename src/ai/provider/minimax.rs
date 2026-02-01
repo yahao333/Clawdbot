@@ -23,12 +23,11 @@ use tracing::{debug, error, info};
 
 use super::{AiProvider, ChatMessage, ChatRequest, ChatResponse, ModelConfig, TokenUsage};
 use crate::infra::error::Result;
-
-/// MiniMax API 基础 URL（中国区）
-const MINIMAX_BASE_URL: &str = "https://api.minimaxi.com/v1/text";
-
-/// MiniMax 默认模型
-const DEFAULT_MODEL: &str = "abab6.5s-chat";
+use crate::ai::constants::{
+    MINIMAX_BASE_URL, MINIMAX_DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
+    PROVIDER_MINIMAX,
+};
 
 /// MiniMax Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,9 +52,9 @@ impl Default for MiniMaxConfig {
             api_key: String::new(),
             group_id: String::new(),
             base_url: None,
-            model: Some(DEFAULT_MODEL.to_string()),
-            temperature: Some(0.7),
-            max_tokens: Some(4096),
+            model: Some(MINIMAX_DEFAULT_MODEL.to_string()),
+            temperature: Some(DEFAULT_TEMPERATURE),
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
         }
     }
 }
@@ -220,7 +219,7 @@ impl MiniMaxProvider {
     /// 创建的 Provider
     pub fn new(config: MiniMaxConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("创建 HTTP 客户端失败");
 
@@ -238,7 +237,8 @@ impl MiniMaxProvider {
 
     /// 获取模型名称
     fn get_model(&self) -> String {
-        self.config.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        self.config.model.clone()
+            .unwrap_or_else(|| MINIMAX_DEFAULT_MODEL.to_string())
     }
 }
 
@@ -246,7 +246,7 @@ impl MiniMaxProvider {
 impl AiProvider for MiniMaxProvider {
     /// 获取 Provider 名称
     fn name(&self) -> &str {
-        "minimax"
+        PROVIDER_MINIMAX
     }
 
     /// 发送聊天请求

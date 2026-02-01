@@ -21,6 +21,12 @@ use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::provider::{AiProvider, ChatMessage, ChatRequest, ModelConfig, ProviderRegistry, TokenUsage, MessageRole};
+use super::constants::{
+    DEFAULT_PROVIDER, DEFAULT_SYSTEM_PROMPT, MAX_HISTORY_MESSAGES,
+    get_default_model, get_base_url,
+    PROVIDER_ANTHROPIC, PROVIDER_OPENAI, PROVIDER_DEEPSEEK, PROVIDER_MINIMAX,
+    ANTHROPIC_API_VERSION,
+};
 use crate::core::message::types::{InboundMessage, MessageContent};
 use crate::infra::config::{AiConfig, Config, ProviderConfig};
 use crate::infra::error::Result;
@@ -81,7 +87,7 @@ impl AiEngine {
             config: Arc::new(ai_config),
             default_provider: None,
             conversation_history: Arc::new(dashmap::DashMap::new()),
-            max_history: 20,
+            max_history: MAX_HISTORY_MESSAGES,
         }
     }
 
@@ -101,7 +107,7 @@ impl AiEngine {
             config,
             default_provider: None,
             conversation_history: Arc::new(dashmap::DashMap::new()),
-            max_history: 20,
+            max_history: MAX_HISTORY_MESSAGES,
         }
     }
 
@@ -111,20 +117,20 @@ impl AiEngine {
             debug!(provider = %name, "注册 Provider");
 
             match name.as_str() {
-                "anthropic" => {
+                PROVIDER_ANTHROPIC => {
                     let config = super::provider::anthropic::AnthropicConfig {
                         api_key: provider_config.api_key.clone().unwrap_or_default(),
                         base_url: provider_config.base_url.clone(),
                         model: provider_config.model.clone(),
                         temperature: provider_config.temperature,
                         max_tokens: provider_config.max_tokens,
-                        api_version: Some("2023-06-01".to_string()),
+                        api_version: Some(ANTHROPIC_API_VERSION.to_string()),
                     };
                     let provider = super::provider::anthropic::AnthropicProvider::new(config);
                     registry.register(provider);
                     info!(provider = %name, "Anthropic Provider 注册成功");
                 }
-                "openai" => {
+                PROVIDER_OPENAI => {
                     let config = super::provider::openai::OpenAIConfig {
                         api_key: provider_config.api_key.clone().unwrap_or_default(),
                         base_url: provider_config.base_url.clone(),
@@ -137,7 +143,7 @@ impl AiEngine {
                     registry.register(provider);
                     info!(provider = %name, "OpenAI Provider 注册成功");
                 }
-                "minimax" => {
+                PROVIDER_MINIMAX => {
                     let config = super::provider::minimax::MiniMaxConfig {
                         api_key: provider_config.api_key.clone().unwrap_or_default(),
                         group_id: provider_config.group_id.clone().unwrap_or_default(),
@@ -150,7 +156,7 @@ impl AiEngine {
                     registry.register(provider);
                     info!(provider = %name, "MiniMax Provider 注册成功");
                 }
-                "deepseek" => {
+                PROVIDER_DEEPSEEK => {
                     let config = super::provider::deepseek::DeepSeekConfig {
                         api_key: provider_config.api_key.clone().unwrap_or_default(),
                         base_url: provider_config.base_url.clone(),
@@ -285,7 +291,7 @@ impl AiEngine {
             .unwrap_or_else(|| {
                 self.registry.list().first()
                     .cloned()
-                    .unwrap_or_else(|| "openai".to_string())
+                    .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
             })
     }
 
@@ -294,12 +300,13 @@ impl AiEngine {
         // TODO: 从 Agent 配置获取模型配置
         // 临时使用默认配置
         let provider_name = self.get_agent_provider(agent_id);
+        let default_model = get_default_model(&provider_name);
 
         ModelConfig {
             provider: provider_name.clone(),
             model: self.config.providers.get(&provider_name)
                 .and_then(|c| c.model.clone())
-                .unwrap_or_else(|| "gpt-4o".to_string()),
+                .unwrap_or_else(|| default_model.to_string()),
             api_key: None,
             base_url: None,
             temperature: self.config.providers.get(&provider_name)
@@ -324,7 +331,7 @@ impl AiEngine {
         // TODO: 从 Agent 配置获取系统提示
         messages.push(ChatMessage {
             role: MessageRole::System,
-            content: "你是一个智能助手，请用简洁清晰的语言回答用户的问题。".to_string(),
+            content: DEFAULT_SYSTEM_PROMPT.to_string(),
             name: None,
         });
 

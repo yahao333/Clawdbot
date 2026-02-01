@@ -23,12 +23,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{AiProvider, ChatMessage, ChatRequest, ChatResponse, ModelConfig, ProviderRegistry, TokenUsage};
 use crate::infra::error::Result;
-
-/// Anthropic API 基础 URL
-const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-
-/// Anthropic 默认模型
-const DEFAULT_MODEL: &str = "claude-3-5-sonnet-20241022";
+use crate::ai::constants::{
+    ANTHROPIC_BASE_URL, ANTHROPIC_DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
+    ANTHROPIC_API_VERSION, PROVIDER_ANTHROPIC,
+};
 
 /// Anthropic Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,10 +51,10 @@ impl Default for AnthropicConfig {
         Self {
             api_key: String::new(),
             base_url: None,
-            model: Some(DEFAULT_MODEL.to_string()),
-            temperature: Some(0.7),
-            max_tokens: Some(4096),
-            api_version: Some("2023-06-01".to_string()),
+            model: Some(ANTHROPIC_DEFAULT_MODEL.to_string()),
+            temperature: Some(DEFAULT_TEMPERATURE),
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
+            api_version: Some(ANTHROPIC_API_VERSION.to_string()),
         }
     }
 }
@@ -144,7 +143,7 @@ impl AnthropicProvider {
     /// 创建的 Provider
     pub fn new(config: AnthropicConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(DEFAULT_TIMEOUT)
             .build()
             .expect("创建 HTTP 客户端失败");
 
@@ -162,7 +161,8 @@ impl AnthropicProvider {
 
     /// 获取模型名称
     fn get_model(&self) -> String {
-        self.config.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        self.config.model.clone()
+            .unwrap_or_else(|| ANTHROPIC_DEFAULT_MODEL.to_string())
     }
 }
 
@@ -170,7 +170,7 @@ impl AnthropicProvider {
 impl AiProvider for AnthropicProvider {
     /// 获取 Provider 名称
     fn name(&self) -> &str {
-        "anthropic"
+        PROVIDER_ANTHROPIC
     }
 
     /// 发送聊天请求
@@ -212,7 +212,7 @@ impl AiProvider for AnthropicProvider {
         let chat_request = AnthropicChatRequest {
             model: model.clone(),
             messages,
-            max_tokens: request.model.max_tokens.unwrap_or(4096),
+            max_tokens: request.model.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             temperature: request.model.temperature.or(self.config.temperature),
             system: system_prompt,
         };
@@ -221,7 +221,8 @@ impl AiProvider for AnthropicProvider {
         let response = self.http_client
             .post(format!("{}/v1/messages", base_url))
             .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", self.config.api_version.clone().unwrap_or_else(|| "2023-06-01".to_string()))
+            .header("anthropic-version", self.config.api_version.clone()
+                .unwrap_or_else(|| ANTHROPIC_API_VERSION.to_string()))
             .header("content-type", "application/json")
             .json(&chat_request)
             .send()

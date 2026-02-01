@@ -20,16 +20,16 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::{AiProvider, ChatMessage, ChatRequest, ChatResponse, ModelConfig, ProviderRegistry, TokenUsage};
 use crate::infra::error::Result;
-
-/// OpenAI API 基础 URL
-const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-
-/// OpenAI 默认模型
-const DEFAULT_MODEL: &str = "gpt-4o";
+use crate::ai::constants::{
+    OPENAI_BASE_URL, OPENAI_DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
+    POOL_IDLE_TIMEOUT, POOL_MAX_IDLE_PER_HOST,
+};
 
 /// OpenAI Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,9 +54,9 @@ impl Default for OpenAIConfig {
             api_key: String::new(),
             base_url: None,
             organization_id: None,
-            model: Some(DEFAULT_MODEL.to_string()),
-            temperature: Some(0.7),
-            max_tokens: Some(4096),
+            model: Some(OPENAI_DEFAULT_MODEL.to_string()),
+            temperature: Some(DEFAULT_TEMPERATURE),
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
         }
     }
 }
@@ -149,7 +149,9 @@ impl OpenAIProvider {
     /// 创建的 Provider
     pub fn new(config: OpenAIConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(DEFAULT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .build()
             .expect("创建 HTTP 客户端失败");
 
@@ -167,7 +169,8 @@ impl OpenAIProvider {
 
     /// 获取模型名称
     fn get_model(&self) -> String {
-        self.config.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        self.config.model.clone()
+            .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string())
     }
 }
 
