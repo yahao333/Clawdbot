@@ -19,7 +19,9 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -30,6 +32,104 @@ use crate::ai::constants::{
     DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
     POOL_IDLE_TIMEOUT, POOL_MAX_IDLE_PER_HOST,
 };
+use crate::ai::stream::{parse_sse_line, SseEvent};
+
+/// SSE 响应流式读取器
+///
+/// 将 HTTP 字节流解析为 SSE 格式并提供 AsyncRead 接口
+struct SseResponseStream<S> {
+    /// 内部字节流
+    inner: S,
+    /// 输出缓冲区
+    output: Vec<u8>,
+    /// 位置偏移
+    position: usize,
+}
+
+impl<S> SseResponseStream<S> {
+    /// 创建新的 SSE 响应流读取器
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            output: Vec::new(),
+            position: 0,
+        }
+    }
+}
+
+impl<S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin> SseResponseStream<S> {
+    /// 处理内部流的一个 chunk
+    fn process_chunk(&mut self, chunk: bytes::Bytes) {
+        let chunk_str = match std::str::from_utf8(&chunk) {
+            Ok(s) => s,
+            Err(_) => {
+                self.output.extend_from_slice(&chunk);
+                return;
+            }
+        };
+
+        for line in chunk_str.lines() {
+            match parse_sse_line(line) {
+                SseEvent::Data(content) => {
+                    if !content.is_empty() {
+                        self.output.extend_from_slice(content.as_bytes());
+                    }
+                }
+                SseEvent::Done => {
+                    self.output.extend_from_slice(b"[DONE]");
+                }
+                SseEvent::Error(msg) => {
+                    let error_msg = format!("ERROR: {}\n", msg);
+                    self.output.extend_from_slice(error_msg.as_bytes());
+                }
+                SseEvent::Ignore => {}
+            }
+        }
+    }
+}
+
+impl<S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin> tokio::io::AsyncRead for SseResponseStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // 如果输出缓冲区有数据，直接返回
+        if self.position < self.output.len() {
+            let remaining = &self.output[self.position..];
+            let to_read = std::cmp::min(remaining.len(), buf.remaining());
+
+            if to_read > 0 {
+                buf.put_slice(&remaining[..to_read]);
+                self.position += to_read;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // 重置缓冲区
+        self.output.clear();
+        self.position = 0;
+
+        // 尝试从内部流读取数据
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.process_chunk(chunk);
+                // 递归尝试读取（尾递归优化）
+                self.poll_read(cx, buf)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                let error_msg = format!("Stream error: {}", e);
+                buf.put_slice(error_msg.as_bytes());
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                // 流结束
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// OpenAI Provider 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,7 +420,8 @@ impl AiProvider for OpenAIProvider {
         let mut request_builder = self.http_client
             .post(format!("{}/chat/completions", base_url))
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
 
         if let Some(org_id) = &self.config.organization_id {
             request_builder = request_builder.header("OpenAI-Organization", org_id);
@@ -338,9 +439,16 @@ impl AiProvider for OpenAIProvider {
             return Err(crate::infra::error::Error::Ai(format!("OpenAI API 错误: {}", error_text)));
         }
 
-        // 将响应体转换为 AsyncRead
-        // 使用 tokio::io::Empty 作为占位实现
-        Ok(Box::new(tokio::io::empty()) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+        // 创建 SSE 流式读取器
+        let body = response.bytes_stream();
+        let stream_reader = SseResponseStream::new(body);
+
+        debug!(model = %model, "开始流式响应");
+
+        // 将其转换为 trait object
+        let boxed_stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(stream_reader);
+
+        Ok(boxed_stream)
     }
 
     /// 创建嵌入向量
