@@ -78,6 +78,8 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 # dirs：获取系统目录（用于存储审计日志）
 dirs = "5"
+# bytes：字节处理（用于流式响应）
+bytes = "1.5"
 
 # -------------------- Sandbox 模块依赖 --------------------
 # dashmap：高性能并发 HashMap（用于用户沙箱缓存）
